@@ -1,0 +1,61 @@
+[project]
+name = "fastapi-template"
+version = "0.1.0"
+description = "FastAPI template with Clean Architecture and PostgreSQL"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic>=1.16",
+    "asyncpg>=0.30",
+    "fastapi>=0.116",
+    "pydantic-settings>=2.10",
+    "sentry-sdk[fastapi,sqlalchemy]>=2.47",
+    "sqlalchemy>=2.0",
+    "uvicorn[standard]>=0.35",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.32",
+    "flake8>=7.3",
+    "httpx2>=0.1",
+    "mypy>=2.2",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "ruff>=0.12",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--strict-markers"
+markers = [
+    "infrastructure: requires local infrastructure, another service, an external provider, or secrets",
+]
+
+[tool.ruff]
+line-length = 119
+target-version = "py314"
+extend-exclude = [".github", ".helm"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api", "core", "depends", "models", "repositories", "settings", "utils"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.basedpyright]
+include = ["src"]
+extraPaths = ["src"]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+reportMissingImports = "error"
+reportMissingModuleSource = "error"
+reportImportCycles = "warning"

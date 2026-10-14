@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from api import yandex_metrica, yandex_metrica_router
+from containers import services_container
 from core.exceptions import AppError
 from settings import settings
 from utils.configure_sentry import configure_sentry
@@ -18,7 +20,17 @@ async def lifespan(_: FastAPI):
     await close_database()
 
 
+services_container.wire(
+    modules=[yandex_metrica],
+)
+
+
 app = FastAPI(title=settings.app_title, debug=settings.debug, lifespan=lifespan)
+app.state.container = services_container
+
+router = APIRouter(prefix="/api")
+router.include_router(yandex_metrica_router, prefix="/metrica", tags=["Yandex Metrica"])
+app.include_router(router)
 
 
 @app.get("/health", tags=["Health"])

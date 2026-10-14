@@ -21,12 +21,16 @@ class Settings(BaseSettings):
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
     postgres_db: str = Field(default="app", alias="POSTGRES_DB")
 
+    encryption_service_key: str = Field(default="", alias="ENCRYPTION_SERVICE_KEY")
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> Settings:
         if self.sentry_enabled and not self.sentry_dsn:
             raise ValueError("SENTRY_DSN is required when SENTRY_ENABLED=true")
+        if self.encryption_service_key == "":
+            raise ValueError("ENCRYPTION_SERVICE_KEY is required")
         return self
 
     @cached_property

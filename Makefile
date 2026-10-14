@@ -1,4 +1,4 @@
-.PHONY: format lint test test-infra
+.PHONY: format lint test test-cov test-infra
 
 format:
 	uv run ruff check . --fix
@@ -11,6 +11,9 @@ lint:
 
 test:
 	uv run pytest -m "not infrastructure"
+
+test-cov:
+	uv run pytest -m "not infrastructure" --cov --cov-report=term-missing
 
 test-infra:
 	@uv run pytest -m infrastructure; status=$$?; \

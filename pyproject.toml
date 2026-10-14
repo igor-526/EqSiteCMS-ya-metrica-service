@@ -26,6 +26,7 @@ dev = [
     "mypy>=2.2",
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
+    "pytest-cov>=7.1.0",
     "ruff>=0.12",
 ]
 
@@ -63,3 +64,12 @@ typeCheckingMode = "standard"
 reportMissingImports = "error"
 reportMissingModuleSource = "error"
 reportImportCycles = "warning"
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = ["src/core/protocols/*", "src/migration/versions/20260710_0001_initial.py", "*.pyx"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100

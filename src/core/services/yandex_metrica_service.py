@@ -2,7 +2,7 @@ import logging
 
 from pydantic import ValidationError
 
-from core.exceptions import ClientError
+from core.exceptions import ClientError, YandexClientException
 from core.protocols.clients import YandexMetricaClientProtocol
 from core.schemas.api import YandexMetricaCounterOutDto, YandexMetricaCounterResponseOutDto
 from core.services.encryption_service import EncryptionService
@@ -28,39 +28,38 @@ class YandexMetricaService:
             offset = 0
         try:
             decrypted_access_token = self._encryption_service.decrypt(data=access_token)
-        except ValueError as ve:
-            logger.error("Error while decrypting access token")
-            raise ClientError("Ошибка расшифровки токена") from ve
         except Exception as ex:
-            logger.error(f"Error: {ex}")
-            raise ClientError(f"Ошибка: {ex}") from ex
-        raw_response = await self._yandex_metrica_client.get_counters(
-            access_token=decrypted_access_token,
-            search=search,
-            limit=limit,
-            offset=offset,
-        )
-        total = raw_response.get("rows", None)
+            logger.error("Access token decryption failed")
+            raise ClientError("Ошибка расшифровки токена") from ex
         try:
-            total = int(total)
-        except ValueError as ex:
-            logging.error(f"Incorrent response from yandex_metrica: {raw_response}")
+            raw_response = await self._yandex_metrica_client.get_counters(
+                access_token=decrypted_access_token,
+                search=search,
+                limit=limit,
+                offset=offset,
+            )
+        except YandexClientException as ex:
+            raise ClientError("Ошибка получения счётчиков Яндекс.Метрики") from ex
+        try:
+            total = int(raw_response["rows"])
+        except (KeyError, TypeError, ValueError) as ex:
+            logger.error("Invalid Yandex.Metrica response total")
             raise ClientError("Яндекс выдал некорректный ответ") from ex
         counters: list[YandexMetricaCounterOutDto] = []
-        raw_response_counters = raw_response.get("counters", None)
+        raw_response_counters = raw_response.get("counters")
         if not isinstance(raw_response_counters, list):
-            logging.error(f"Incorrent response from yandex_metrica: {raw_response}")
+            logger.error("Invalid Yandex.Metrica counters list")
             raise ClientError("Яндекс выдал некорректный ответ")
         for ya_counter in raw_response_counters:
+            if not isinstance(ya_counter, dict):
+                logger.warning("Invalid counter in Yandex.Metrica response")
+                continue
             try:
                 counters.append(
-                    YandexMetricaCounterOutDto(
-                        counter_id=ya_counter.get("id", None), site=ya_counter.get("site", None)
+                    YandexMetricaCounterOutDto.model_validate(
+                        {"counter_id": ya_counter.get("id"), "site": ya_counter.get("site")}
                     )
                 )
             except ValidationError:
-                logging.error(f"Invalid counter from Yandex.Metrica response: {ya_counter}")
-                continue
-            except Exception:
-                logging.error(f"Error while adding Yandex.Metrica counter from Yandex.Metrica response: {ya_counter}")
+                logger.warning("Invalid counter in Yandex.Metrica response")
         return YandexMetricaCounterResponseOutDto(total=total, items=counters)

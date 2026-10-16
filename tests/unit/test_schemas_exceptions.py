@@ -71,11 +71,20 @@ def test_application_exceptions_preserve_message_and_status(error_class, status)
     assert isinstance(error, AppError)
 
 
-@pytest.mark.parametrize(
-    ("error", "description", "suffix"),
-    [(None, None, ""), ("denied", None, "\nError: denied"), (None, "detail", "\nError description: detail")],
-)
-def test_yandex_exception_optional_details(error, description, suffix):
-    exception = YandexClientException(403, error, description)
+@pytest.mark.parametrize("status", [403, None])
+@pytest.mark.parametrize("details", [(None, None), ("SECRET_MARKER", None), (None, "SECRET_MARKER")])
+def test_yandex_exception_legacy_arguments_are_safe(status, details):
+    exception = YandexClientException(status, *details)
 
-    assert str(exception) == exception.message == "Yandex Client exception \nStatus code: 403" + suffix
+    assert exception.status == status
+    assert str(exception) == exception.message == exception.args[0]
+    assert f"Status code: {status}" in exception.message
+    assert "SECRET_MARKER" not in str(exception)
+
+
+@pytest.mark.parametrize("category", ["timeout", "transport", "http", "response", "SECRET_MARKER"])
+def test_yandex_exception_category_is_allowlisted(category):
+    exception = YandexClientException(None, category=category)
+
+    assert exception.category == ("client" if category == "SECRET_MARKER" else category)
+    assert "SECRET_MARKER" not in exception.message

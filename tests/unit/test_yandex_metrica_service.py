@@ -67,7 +67,6 @@ async def test_invalid_counters_are_skipped_without_losing_valid_entries(depende
         "items": [{"counter_id": 7, "site": "first.example"}, {"counter_id": 9, "site": "last.example"}],
     }
     assert "Invalid counter" in caplog.text
-    assert "Error while adding" in caplog.text
 
 
 @pytest.mark.parametrize("rows", ["bad", "", "3.5"])
@@ -81,11 +80,6 @@ async def test_invalid_total_is_reported_as_client_error(dependencies, rows):
     assert isinstance(error.value.__cause__, ValueError)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="Некорректный rows должен давать ClientError, но int(rows) выпускает необработанный TypeError",
-)
 @pytest.mark.parametrize(
     "response",
     [
@@ -114,7 +108,7 @@ async def test_non_list_counters_are_reported_as_client_error(dependencies, coun
 
 @pytest.mark.parametrize(
     ("cause", "message"),
-    [(ValueError("bad token"), "Ошибка расшифровки токена"), (RuntimeError("broken"), "Ошибка: broken")],
+    [(ValueError("bad token"), "Ошибка расшифровки токена"), (RuntimeError("broken"), "Ошибка расшифровки токена")],
 )
 async def test_decryption_failure_does_not_call_yandex(dependencies, cause, message):
     service, client, encryption = dependencies
@@ -127,12 +121,44 @@ async def test_decryption_failure_does_not_call_yandex(dependencies, cause, mess
     client.get_counters.assert_not_awaited()
 
 
-async def test_yandex_errors_are_propagated(dependencies):
+@pytest.mark.parametrize("status", [None, 403, 503])
+async def test_yandex_errors_are_mapped_with_cause(dependencies, status, caplog, capsys):
     service, client, _ = dependencies
-    cause = YandexClientException(403, "forbidden")
+    cause = YandexClientException(status, "SECRET_MARKER")
     client.get_counters.side_effect = cause
 
-    with pytest.raises(YandexClientException) as error:
+    with pytest.raises(ClientError, match="Ошибка получения счётчиков Яндекс.Метрики") as error:
         await service.get_counters(access_token="encrypted")
 
+    assert error.value.__cause__ is cause
+    assert "SECRET_MARKER" not in str(error.value) + caplog.text + capsys.readouterr().out
+    client.get_counters.assert_awaited_once()
+
+
+async def test_unrelated_client_programming_error_is_not_masked(dependencies):
+    service, client, _ = dependencies
+    cause = RuntimeError("internal failure")
+    client.get_counters.side_effect = cause
+    with pytest.raises(RuntimeError) as error:
+        await service.get_counters(access_token="encrypted")
     assert error.value is cause
+
+
+@pytest.mark.parametrize("counters", [[], [None, {"id": None, "site": "SECRET_MARKER"}]])
+async def test_empty_after_skip_keeps_upstream_total(dependencies, counters, caplog):
+    service, client, _ = dependencies
+    client.get_counters.return_value = {"rows": "12", "counters": counters}
+    result = await service.get_counters(access_token="encrypted")
+    assert result.model_dump() == {"total": 12, "items": []}
+    assert "SECRET_MARKER" not in caplog.text
+
+
+@pytest.mark.parametrize("cause", [ValueError("SECRET_MARKER"), RuntimeError("SECRET_MARKER")])
+async def test_decrypt_failure_is_safe(dependencies, cause, caplog):
+    service, client, encryption = dependencies
+    encryption.decrypt.side_effect = cause
+    with pytest.raises(ClientError) as error:
+        await service.get_counters(access_token="SECRET_MARKER")
+    assert error.value.__cause__ is cause
+    assert "SECRET_MARKER" not in str(error.value) + caplog.text
+    client.get_counters.assert_not_awaited()

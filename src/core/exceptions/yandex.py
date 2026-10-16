@@ -1,9 +1,16 @@
 class YandexClientException(Exception):
-    def __init__(self, status: int, error: str | None = None, error_description: str | None = None) -> None:
-        message = f"Yandex Client exception \nStatus code: {status}"
-        if error:
-            message += f"\nError: {error}"
-        if error_description:
-            message += f"\nError description: {error_description}"
-        self.message = message
-        super().__init__(message)
+    """Безопасная ошибка интеграции; исходные данные доступны только через cause."""
+
+    def __init__(
+        self,
+        status: int | None,
+        error: str | None = None,
+        error_description: str | None = None,
+        *,
+        category: str = "client",
+    ) -> None:
+        # Legacy arguments remain accepted, but upstream text is never rendered.
+        self.status = status
+        self.category = category if category in {"client", "timeout", "transport", "http", "response"} else "client"
+        self.message = f"Yandex Client exception \nStatus code: {status}\nCategory: {self.category}"
+        super().__init__(self.message)

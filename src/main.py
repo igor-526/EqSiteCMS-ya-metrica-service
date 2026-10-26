@@ -8,6 +8,7 @@ from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from api import yandex_metrica, yandex_metrica_router
+from api.parse import router as parse_router
 from containers import services_container
 from core.exceptions import AppError
 from settings import settings
@@ -65,6 +66,7 @@ app.add_middleware(SafeUnexpectedErrorMiddleware)
 
 router = APIRouter(prefix="/api")
 router.include_router(yandex_metrica_router, prefix="/metrica", tags=["Yandex Metrica"])
+router.include_router(parse_router, prefix="/metrica", tags=["Yandex Metrica"])
 app.include_router(router)
 
 
@@ -75,7 +77,15 @@ async def health() -> dict[str, str]:
 
 logger = logging.getLogger(__name__)
 SAFE_DETAILS = frozenset(
-    {"Ошибка расшифровки токена", "Ошибка получения счётчиков Яндекс.Метрики", "Яндекс выдал некорректный ответ"}
+    {
+        "Ошибка расшифровки токена",
+        "Ошибка получения счётчиков Яндекс.Метрики",
+        "Яндекс выдал некорректный ответ",
+        "Некорректный диапазон дат",
+        "Счётчик Яндекс.Метрики не привязан к конюшне",
+        "Парсинг конюшни уже выполняется",
+        "Не удалось получить данные интеграции Яндекс",
+    }
 )
 
 

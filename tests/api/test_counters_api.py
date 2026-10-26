@@ -157,7 +157,7 @@ def test_real_client_service_failure_chain(client, monkeypatch, mode, caplog, ca
         return httpx.Response(200, json=payloads[mode])
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr("clients.yandex_metrica.httpx.AsyncClient", lambda: upstream)
+    monkeypatch.setattr("clients.base.httpx.AsyncClient", lambda: upstream)
     token = EncryptionService(settings.encryption_service_key).encrypt(data="SECRET_MARKER")
     with clients_container.yandex_metrica_client.override(YandexMetricaClient()):
         response = client.get("/api/metrica/counters", params={"access_token": token})
@@ -194,7 +194,7 @@ def test_real_client_service_partial_and_empty_200(client, monkeypatch, rows, co
         return httpx.Response(200, json={"rows": rows, "counters": counters})
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr("clients.yandex_metrica.httpx.AsyncClient", lambda: upstream)
+    monkeypatch.setattr("clients.base.httpx.AsyncClient", lambda: upstream)
     token = EncryptionService(settings.encryption_service_key).encrypt(data="oauth-token")
     with clients_container.yandex_metrica_client.override(YandexMetricaClient()):
         response = client.get("/api/metrica/counters", params={"access_token": token, "limit": 200, "offset": -1})

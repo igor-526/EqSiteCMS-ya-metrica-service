@@ -15,7 +15,7 @@ def transport_client(monkeypatch):
 
     def install(handler):
         client = original_client(transport=httpx.MockTransport(handler))
-        monkeypatch.setattr("clients.yandex_metrica.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("clients.base.httpx.AsyncClient", lambda: client)
         return client
 
     return install
@@ -239,7 +239,7 @@ async def test_lifecycle_failures_are_wrapped(monkeypatch, phase, cause_type):
             raise cause
         return client
 
-    monkeypatch.setattr("clients.yandex_metrica.httpx.AsyncClient", create)
+    monkeypatch.setattr("clients.base.httpx.AsyncClient", create)
     with pytest.raises(YandexClientException) as error:
         await YandexMetricaClient().make_request(url="test")
 

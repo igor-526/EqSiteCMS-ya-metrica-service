@@ -66,3 +66,65 @@ def test_online_migrations_connect_run_sync_and_dispose(monkeypatch):
     connection.run_sync.assert_awaited_once()
     connection_context.__aexit__.assert_awaited_once_with(None, None, None)
     engine.dispose.assert_awaited_once_with()
+
+
+def test_revision_is_frozen_and_has_expected_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(Config(str(ENV_PATH.parents[1] / "alembic.ini")))
+    assert script.get_current_head() == "20261026_0002"
+    revision = script.get_revision("head")
+    assert revision.down_revision == "20260710_0001"
+    tables = revision.module.revision_metadata.tables
+    assert set(tables) == {
+        "metrica_parse_runs",
+        "metrica_parse_tasks",
+        "metrica_page_stats",
+        "metrica_search_query_stats",
+    }
+    for name, table in tables.items():
+        assert table is not metadata.tables[name]
+
+
+def test_domain_entities_and_invariants():
+    from datetime import date
+    from uuid import uuid4
+
+    from pydantic import ValidationError
+
+    from core.entities import DateMode, ParseErrorCode, ParseKind, ParseRun, ParseTask, StatRow, TaskStatus
+
+    run = ParseRun(equestrian_id=uuid4(), date_mode=DateMode.EXPLICIT)
+    assert run.clamped is False
+    data = dict(
+        run_id=run.id,
+        equestrian_id=run.equestrian_id,
+        counter_id="105850153",
+        yandex_account_id=uuid4(),
+        kind=ParseKind.PAGES,
+        date_from=date(2026, 10, 21),
+        date_to=date(2026, 10, 25),
+        sequence=0,
+        max_attempts=3,
+    )
+    task = ParseTask(**data)
+    assert task.status == TaskStatus.QUEUED
+    assert task.next_offset == 1
+    assert task.rows_fetched == 0
+    assert len(ParseErrorCode) == 13
+    with pytest.raises(ValidationError, match="1 to 5 days"):
+        ParseTask(**{**data, "date_to": date(2026, 10, 26)})
+    row = StatRow(
+        equestrian_id=run.equestrian_id,
+        entity_id=uuid4(),
+        stat_date=date(2026, 10, 21),
+        visits=3,
+        users=3,
+        pageviews=6,
+        bounces=1,
+        visit_duration_seconds=300,
+    )
+    assert row.parse_task_id is None
+    with pytest.raises(ValidationError, match="Bounces"):
+        StatRow(**{**row.model_dump(), "bounces": 4})

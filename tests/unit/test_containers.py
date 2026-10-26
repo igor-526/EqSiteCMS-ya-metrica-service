@@ -75,3 +75,53 @@ def test_client_override_restores_real_factory():
         assert services_container.yandex_metrica_service()._yandex_metrica_client is fake
     assert not clients_container.yandex_metrica_client.overridden
     assert isinstance(services_container.yandex_metrica_service()._yandex_metrica_client, YandexMetricaClient)
+
+
+def test_parse_graph_shares_one_session_without_global_override():
+    from unittest.mock import MagicMock
+
+    from containers.application import celery_app_provider, create_parse_services
+    from core.entities.metrica_parse import ParseKind
+
+    session = MagicMock()
+    other_session = MagicMock()
+    original_overrides = repositories_container.session.overridden
+    with celery_app_provider.override(MagicMock()):
+        services = create_parse_services(session)
+        runner = services.task_runner()
+        enqueue = services.parse_enqueue_service()
+        dispatch = services.parse_dispatch_service()
+        assert runner._transaction is runner._ingestion._transaction is session
+        assert enqueue._transaction is dispatch._transaction is session
+        assert runner._tasks.session is runner._ingestion._tasks.session is session
+        assert enqueue._runs.session is session
+        for kind in ParseKind:
+            assert runner._stats[kind].session is runner._ingestion._stats[kind].session is session
+            assert enqueue._stats[kind].session is session
+        assert create_parse_services(other_session).task_runner()._transaction is other_session
+        assert services.task_runner()._transaction is session
+        assert runner._lease_seconds == settings_container.app_settings().task_lease_seconds
+        assert runner._ingestion._limit == settings_container.app_settings().ya_metrica_stat_page_limit
+        assert enqueue._max_attempts == settings_container.app_settings().task_max_attempts
+        assert enqueue._resolver._utc_offset_hours == settings_container.app_settings().ya_metrica_utc_offset_hours
+    assert repositories_container.session.overridden == original_overrides
+
+
+def test_celery_di_singleton_and_cli_entrypoint(monkeypatch):
+    import importlib
+
+    from containers.application import celery_app_provider
+    from settings import CelerySettings
+
+    custom = CelerySettings(_env_file=None, REDIS_PASSWORD="test-only")
+    celery_app_provider.reset()
+    with settings_container.celery_settings.override(custom):
+        first = celery_app_provider()
+        try:
+            assert celery_app_provider() is first
+            module = importlib.import_module("workers.celery_app")
+            assert module.celery_app is first
+            assert services_container.parse_dispatcher()._app is first
+        finally:
+            first.close()
+            celery_app_provider.reset()

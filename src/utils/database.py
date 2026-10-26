@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -48,3 +49,15 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 
 async def close_database() -> None:
     await async_engine.dispose()
+
+
+@asynccontextmanager
+async def worker_session() -> AsyncIterator[AsyncSession]:
+    """Engine/session belong to this event loop; services own short transactions."""
+    engine = make_async_engine(settings.database_url, use_null_pool=True)
+    try:
+        factory = make_async_session_factory(engine)
+        async with factory() as session:
+            yield session
+    finally:
+        await engine.dispose()

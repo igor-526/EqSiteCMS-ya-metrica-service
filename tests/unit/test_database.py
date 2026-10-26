@@ -113,3 +113,46 @@ async def test_database_shutdown_disposes_engine(monkeypatch):
     monkeypatch.setattr(database, "async_engine", engine)
     await database.close_database()
     engine.dispose.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_worker_session_owns_nullpool_engine_and_disposes(monkeypatch, failure):
+    engine = AsyncMock()
+    session = AsyncMock(spec=AsyncSession)
+    context = AsyncMock()
+    context.__aenter__.return_value = session
+    engine_factory = MagicMock(return_value=engine)
+    factory = MagicMock(return_value=context)
+    monkeypatch.setattr(database, "make_async_engine", engine_factory)
+    session_factory = MagicMock(return_value=factory)
+    monkeypatch.setattr(database, "make_async_session_factory", session_factory)
+
+    async def invoke():
+        async with database.worker_session() as actual:
+            assert actual is session
+            engine.dispose.assert_not_awaited()
+            if failure:
+                raise ValueError("body failed")
+
+    if failure:
+        with pytest.raises(ValueError, match="body failed"):
+            await invoke()
+    else:
+        await invoke()
+    engine_factory.assert_called_once_with(settings.database_url, use_null_pool=True)
+    session_factory.assert_called_once_with(engine)
+    engine.dispose.assert_awaited_once_with()
+    session.begin.assert_not_called()
+    session.commit.assert_not_awaited()
+    context.__aexit__.assert_awaited_once()
+
+
+async def test_worker_disposes_when_session_factory_fails(monkeypatch):
+    engine = AsyncMock()
+    monkeypatch.setattr(database, "make_async_engine", lambda *args, **kwargs: engine)
+    factory = MagicMock(side_effect=RuntimeError("factory failed"))
+    monkeypatch.setattr(database, "make_async_session_factory", factory)
+    with pytest.raises(RuntimeError, match="factory failed"):
+        async with database.worker_session():
+            pytest.fail("must not yield")
+    engine.dispose.assert_awaited_once_with()

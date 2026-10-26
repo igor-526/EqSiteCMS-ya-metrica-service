@@ -187,3 +187,33 @@ def test_celery_validation_errors_hide_credentials():
         )
     assert "marker-do-not-log" not in str(error.value)
     assert "redis://" not in str(error.value)
+
+
+@pytest.mark.parametrize("use_aliases", [False, True])
+def test_celery_constructor_accepts_canonical_names_and_aliases(use_aliases):
+    from urllib.parse import unquote, urlsplit
+
+    values = {
+        "celery_app_main": "custom-worker",
+        "celery_app_broker": "rediss://broker.invalid:6380/5",
+        "celery_app_backend": "rediss://backend.invalid:6381/6",
+        "redis_password": "synthetic:/@ ?#",
+    }
+    if use_aliases:
+        values = {name.upper(): value for name, value in values.items()}
+    config = CelerySettings(_env_file=None, **values)
+    assert config.celery_app_main == "custom-worker"
+    for field, host, port, db in [
+        ("celery_app_broker", "broker.invalid", 6380, "/5"),
+        ("celery_app_backend", "backend.invalid", 6381, "/6"),
+    ]:
+        url = urlsplit(getattr(config, field))
+        assert (url.scheme, url.hostname, url.port, url.path) == ("rediss", host, port, db)
+        assert unquote(url.password) == "synthetic:/@ ?#"
+    assert config.redis_password.get_secret_value() == "synthetic:/@ ?#"
+    assert "synthetic" not in repr(config)
+
+
+def test_canonical_celery_url_is_validated_not_silently_ignored():
+    with pytest.raises(ValidationError, match="database 5"):
+        CelerySettings(_env_file=None, redis_password="synthetic", celery_app_broker="redis://localhost:6379/3")

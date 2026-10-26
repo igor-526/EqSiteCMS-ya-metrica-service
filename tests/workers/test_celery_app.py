@@ -19,6 +19,7 @@ def test_app_configuration_and_discovery():
         assert conf.task_serializer == conf.result_serializer == "json"
         assert conf.accept_content == ["json"]
         assert conf.task_acks_late and conf.task_reject_on_worker_lost and conf.task_ignore_result
+        assert conf.task_expires == 3600
         assert conf.worker_prefetch_multiplier == 1
         assert conf.broker_transport_options == {"visibility_timeout": 3600}
         assert conf.beat_schedule == {"metrica-dispatch-ready": {"task": "metrica.dispatch_ready", "schedule": 17}}

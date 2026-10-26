@@ -62,7 +62,7 @@ class CelerySettings(BaseSettings):
     redis_password: SecretStr = Field(default=SecretStr(""), alias="REDIS_PASSWORD", repr=False)
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True, populate_by_name=True
     )
 
     @model_validator(mode="after")

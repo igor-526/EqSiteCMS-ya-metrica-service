@@ -19,3 +19,7 @@ class YandexIntegrationUnavailableError(ClientError):
 class ParseAlreadyActiveError(ClientError):
     def __init__(self) -> None:
         super().__init__("Парсинг конюшни уже выполняется")
+
+
+class ParseJobAlreadyExistsError(Exception):
+    """The command already has a persisted run; no new work was enqueued."""

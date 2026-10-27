@@ -2,14 +2,13 @@
 
 Внутренний адаптер Яндекс.Метрики: список счётчиков и асинхронная загрузка
 статистики страниц и поисковых запросов конюшни. Python/FastAPI, SQLAlchemy Core,
-PostgreSQL, Alembic, Celery/Redis; Sentry опционален.
+PostgreSQL, Alembic, NATS JetStream, Celery/Redis; Sentry опционален.
 
 ## API и доступ
 
 | ID | method | path | access class / caller | без auth | с Cookie/Bearer |
 |---|---|---|---|---|---|
 | M1 | GET | `/api/metrica/counters` | Sensitive Private Peer Read; доверенный внутренний caller | 200 / ошибка 400 | то же |
-| M2 | POST | `/api/metrica/stats/parse` | Private Peer Write exception; внутренний сервис | 200 / ошибка 400 | то же |
 | M3 | GET | `/api/metrica/page-stats/table` | Private Peer Read exception; seo-service | 200 / ошибка 400 | то же |
 | M4 | GET | `/api/metrica/page-stats/ranking` | Private Peer Read exception; seo-service | 200 / ошибка 400 | то же |
 | M5 | GET | `/api/metrica/search-query-stats/table` | Private Peer Read exception; доверенный seo-service | 200 / ошибка 400 | то же |
@@ -18,38 +17,76 @@ PostgreSQL, Alembic, Celery/Redis; Sentry опционален.
 
 M1 получает зашифрованный `access_token` в query, расшифровывает в памяти и
 запрашивает список счётчиков. Не передавайте открытый токен и не сохраняйте query
-в логах прокси. M2 не принимает credentials. Cookie/Authorization игнорируются,
+в логах прокси. Cookie/Authorization игнорируются,
 CMS-роли не проверяются; foreign resource ID имеет тот же peer-контракт.
 `equestrian_id` — идентификатор ресурса, не секретный tenant selector.
 Ошибки ввода, маршрутизации и интеграции возвращают локальный `400`, не `401/422/500`.
-M1/M2 не возвращают `204` (этот статус относится к DELETE соседнего yandex-service).
+M1 не возвращает `204` (этот статус относится к DELETE соседнего yandex-service).
 
 Это явные dev service-to-service исключения, **не публичный production API**.
 Production выпуск блокируется до подтверждения внешней сетевой защиты
 чувствительных peers. Данный change не доказывает production isolation.
 
-```http
-POST /api/metrica/stats/parse
-Content-Type: application/json
+## NATS JetStream
 
-{"equestrian_id":"<UUID>","date_from":"2026-10-21","date_to":"2026-10-25"}
-```
+| Stream | Subject | Durable / filter | Назначение | Роль |
+|---|---|---|---|---|
+| `PARSE_COMMANDS` | `commands.parse.ya_metrica.run` | `ya-metrica-parse-run` / тот же subject | Загрузка статистики конюшни | входящий (Consumer) |
 
-Обе даты опциональны и допускают null, лишние поля запрещены. Ответ `200`:
-`run_id`, `equestrian_id`, `date_mode` (`explicit`/`auto`), `clamped`,
-`ranges` (`pages`, `search_queries`, каждый с `date_from/date_to`),
-`tasks` (`id`, `kind`, `date_from`, `date_to`, `sequence`, `status=queued`).
-Без account/counter/profile/credentials. Окно одного задания — не больше пяти дней.
+Канонический контракт: [`docs/asyncapi.yaml`](docs/asyncapi.yaml). seo-service
+(API и scheduler) владеет stream: `commands.parse.>`, FILE, LIMITS,
+`max_age=604800s` по умолчанию. ya-metrica **не создаёт stream**: регистрирует
+pull durable (`deliver=all`, `ack=explicit`, `ack_wait=30s`, `max_deliver=5`).
+Команды других провайдеров отсекаются filter subject.
 
-- «Сегодня» вычисляется по UTC + `YA_METRICA_UTC_OFFSET_HOURS` (по умолчанию +3).
+Envelope: `schema_version=1`, `occurred_at` с часовым поясом, `job_id`,
+`provider=ya_metrica`, `equestrian_id`, `trigger=schedule|manual`,
+`window={"mode":"auto"}` либо
+`{"mode":"explicit","date_from":"YYYY-MM-DD","date_to":"YYYY-MM-DD"}`,
+`params={}`. Лишние поля запрещены. Токены, ciphertext, account ID и профиль
+Яндекса не передаются. Header `Nats-Msg-Id` равен
+`uuid5(NAMESPACE_PARSE_COMMANDS, "<provider>:<job_id>")`, где namespace —
+`uuid5(NAMESPACE_DNS, "parse-commands.eqcms")`. Для schedule `job_id` равен
+`uuid5(NAMESPACE_PARSE_COMMANDS, "schedule:<provider>:<equestrian_id>:<локальная дата слота>")`,
+для manual — `uuid4()`. Handler не валидирует транспортные headers и не использует
+их для выбора конюшни. БД исключает повторный запуск по `job_id`
+независимо от окна дедупликации брокера; старые запуски имеют `job_id=NULL`.
+
+| Результат handler | Действие consumer |
+|---|---|
+| Успех, повтор `job_id`, уже активный запуск, нет привязки, невалидный диапазон дат | `ack`, без повторной доставки |
+| Невалидный envelope, несовпадение provider/subject, непустые params | `term`, без повторной доставки |
+| Недоступен yandex-service, ошибка хранилища или другая временная ошибка | `nak`, повтор до `max_deliver` |
+
+`ack` означает устойчивую постановку заданий, а не завершение загрузки.
+Граф сервисов и сессия БД создаются отдельно на каждую доставку.
+Регистрация durable повторяется ограниченно только при отсутствии stream;
+`BadRequestError` не повторяется на этапе setup. Фоновый supervisor
+восстанавливает транспорт с backoff 1–30s при временной недоступности NATS.
+Статический `/health` не доказывает готовность consumer.
+
+Доступ — **Internal Trusted Network Write**: seo-service → ya-metrica,
+без NATS auth и без проверки CMS-ролей (её выполняет backend до публикации).
+Production gate: отдельно подтвердить внешнюю недоступность брокера и peer
+HTTP, доступ только из доверенной сети. Тесты не доказывают изоляцию;
+сетевые настройки change не меняет.
+
+Удалённый `POST /api/metrica/stats/parse` не является peer endpoint:
+без credentials и с Cookie/Bearer возвращает `400` unknown-route, обработчик
+не вызывается, маршрута нет в OpenAPI. Ручной запуск — через backend
+`POST /api/seo/parse-jobs` (ADMIN), далее seo → NATS.
+
+### Окно загрузки
+
+- «Сегодня» — UTC + `YA_METRICA_UTC_OFFSET_HOURS` (по умолчанию +3).
+  **Оператор обязан согласовать его с `SEO_UTC_OFFSET_HOURS`**: иначе локальная
+  дата слота scheduler и границы автоматического окна могут расходиться.
 - Явные даты обрезаются до `[сегодня − 2 календарных года; сегодня]`;
-  результат отражается в `clamped`. Одна дата, перевёрнутый или пустой после
-  обрезки диапазон → `400 «Некорректный диапазон дат»`.
-- Без дат каждый вид начинается с последней сохранённой даты включительно,
+  внутренний результат отражает это в `clamped`. Перевёрнутый или пустой
+  после обрезки диапазон считается невалидным (команда завершается `ack`).
+- В auto каждый вид начинается с последней сохранённой даты включительно,
   но не раньше двухлетней границы; без данных — с этой границы.
-- Нет привязки → `400 «Счётчик Яндекс.Метрики не привязан к конюшне»`.
-- Ошибка yandex-service → `400 «Не удалось получить данные интеграции Яндекс»`.
-- Уже есть queued/running → `400 «Парсинг конюшни уже выполняется»`.
+- Окно одного задания — не больше пяти дней; исполнение — Celery/Redis.
 
 ## Чтение статистики страниц (M3/M4)
 
@@ -167,7 +204,7 @@ Y7 — `/api/connections/metrica/{equestrian_id}`,
 Y5 — `/api/servicing/access-token/{account_id}` → `enc_access_token`.
 Y5 — Sensitive Private Peer Read exception: anonymous и Cookie/Bearer дают
 одинаковые `200`, malformed/missing resource — `400`. Расшифровка только в памяти
-ya-metrica общим ключом; ни ключ, ни ciphertext не входят в результат M2 и логи.
+ya-metrica общим ключом; ни ключ, ни ciphertext не входят в команды NATS и логи.
 
 Аддитивные колонки: `visits`, `users`, `pageviews`, `bounces`,
 `visit_duration_seconds`. Нормализованные дубли (например, `/tours?utm` и `/tours`)
@@ -214,8 +251,8 @@ Generated stored средние рассчитываются из сумм, не
   — общие настройки приложения/телеметрии; API не раскрывает traceback даже при DEBUG.
 
 Из корня монорепозитория: `make ya-metrica-build`, `make ya-metrica`.
-БД и Redis предварительно запускаются через infra; миграция сервиса должна дойти
-до head (`20261026_0002`). Service Compose:
+БД, Redis и NATS предварительно запускаются через infra; миграция сервиса должна дойти
+до head (`20261028_0003`). Service Compose:
 `.docker-compose/docker-compose.ya_metrica.yml` (обязателен service `.env`).
 Подробные границы root-команд — в `SERVICES.md`.
 
@@ -253,6 +290,22 @@ TEST_DATABASE_URL='<операторский DSN postgresql+asyncpg для eqsit
 `eqsitecmsyametrica_test`; не используйте application DB. Integration fixtures
 создают случайные схемы `test_metrica_<uuid>` и удаляют их в `finally`.
 Без `TEST_DATABASE_URL` PostgreSQL тесты пропускаются, такой запуск не доказывает
-полноту suite/coverage. Точечный IT: `TEST_DATABASE_URL=… uv run pytest tests/integration`.
+полноту suite/coverage. Точечный PostgreSQL IT: `TEST_DATABASE_URL=… uv run pytest tests/integration -m "not infrastructure"`.
 `make test-cov` требует 100% строк и ветвей `src` (кроме декларативных Protocol
 и пустой начальной миграции). Live smoke выполняется отдельно, не unit-тестами.
+
+### Real-broker acceptance (IT-NATS-M1)
+
+```bash
+TEST_NATS_URL=nats://127.0.0.1:4222 uv run pytest -m infrastructure tests/integration/test_nats_broker.py -v
+```
+
+Нужен реальный NATS с JetStream. Отсутствие `TEST_NATS_URL`, брокера или
+JetStream — **fail**, не skip. Тест создаёт stream с конфигурацией seo в
+уникальном subject namespace и durable, проверяет filter, explicit ack,
+сохранение durable при переподписке, nak/redelivery, max_deliver и term.
+Удаляются только собственные случайно именованные ресурсы теста. Production
+`PARSE_COMMANDS` и `ya-metrica-parse-run` не затрагиваются.
+`make test` исключает marker `infrastructure`; PostgreSQL и real-broker
+проверки — разные gates. Валидация обоих AsyncAPI из корня:
+`make asyncapi-validate-parse`.

@@ -21,12 +21,15 @@ metrica_parse_runs = Table(
     "metrica_parse_runs",
     metadata,
     uuid_pk(),
+    Column("job_id", UUID(as_uuid=True), nullable=True),
     Column("equestrian_id", UUID(as_uuid=True), nullable=False),
     Column("date_mode", String(8), nullable=False),
     Column("clamped", Boolean, nullable=False, server_default=text("false")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     CheckConstraint("date_mode IN ('explicit', 'auto')", name="ck_metrica_parse_runs_date_mode"),
 )
+
+Index("ux_metrica_parse_runs_job_id", metrica_parse_runs.c.job_id, unique=True)
 
 metrica_parse_tasks = Table(
     "metrica_parse_tasks",

@@ -138,3 +138,14 @@ def test_counter_response_validator_rejects_non_object(response):
 
     with pytest.raises(ValueError, match="Expected a counters object"):
         validate_counters_response(response)
+
+
+def test_http_parse_trigger_and_external_dto_removed():
+    from importlib.util import find_spec
+
+    import main
+
+    assert find_spec("api.parse") is None
+    assert find_spec("core.schemas.api.parse") is None
+    assert "/api/metrica/stats/parse" not in main.app.openapi()["paths"]
+    assert "/health" in main.app.openapi()["paths"]

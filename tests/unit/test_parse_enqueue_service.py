@@ -84,6 +84,7 @@ def env():
     client = SimpleNamespace(get_metrica_binding=AsyncMock(side_effect=get_binding))
     runs = SimpleNamespace(
         lock_equestrian=AsyncMock(side_effect=lock),
+        exists_job=AsyncMock(return_value=False),
         has_active_tasks=AsyncMock(side_effect=active),
         create_run_with_tasks=AsyncMock(side_effect=create),
     )
@@ -229,3 +230,96 @@ async def test_dispatch_failure_after_commit_is_only_safe_warning(env, caplog):
     assert "dispatch failed after commit" in caplog.text
     assert "secret-token" not in caplog.text
     assert "Traceback" not in caplog.text
+
+
+async def test_ut_mp_04_job_id_persisted_and_null_compatible(env):
+    job_id = uuid4()
+    await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=job_id)
+    env.runs.exists_job.assert_awaited_once_with(job_id)
+    run, _ = env.runs.create_run_with_tasks.call_args.args
+    assert run.job_id == job_id
+    env.runs.exists_job.reset_mock()
+    await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=None)
+    run, _ = env.runs.create_run_with_tasks.call_args.args
+    assert run.job_id is None
+    env.runs.exists_job.assert_not_awaited()
+
+
+async def test_ut_mp_04_redelivery_no_tasks_no_dispatch(env):
+    from core.exceptions.parse import ParseJobAlreadyExistsError
+
+    job_id = uuid4()
+    await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=job_id)
+    for mock in (
+        env.runs.create_run_with_tasks,
+        env.dispatcher.dispatch_account,
+        env.runs.has_active_tasks,
+        env.pages.get_last_stat_date,
+        env.search.get_last_stat_date,
+    ):
+        mock.reset_mock()
+    env.runs.exists_job.return_value = True
+    with pytest.raises(ParseJobAlreadyExistsError):
+        await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=job_id)
+    env.runs.create_run_with_tasks.assert_not_awaited()
+    env.runs.has_active_tasks.assert_not_awaited()
+    env.pages.get_last_stat_date.assert_not_awaited()
+    env.search.get_last_stat_date.assert_not_awaited()
+    env.dispatcher.dispatch_account.assert_not_awaited()
+    assert env.events[-1] == "rollback"
+
+
+async def test_ut_mp_04_concurrent_duplicate_no_dispatch(env):
+    from core.exceptions.parse import ParseJobAlreadyExistsError
+
+    env.runs.create_run_with_tasks.side_effect = ParseJobAlreadyExistsError()
+    with pytest.raises(ParseJobAlreadyExistsError):
+        await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=uuid4())
+    env.dispatcher.dispatch_account.assert_not_awaited()
+    assert env.events[-1] == "rollback"
+
+
+@pytest.mark.parametrize("last", [date(2026, 10, 25), None, date(2026, 10, 21), date(2023, 1, 1)])
+async def test_ut_mp_03_auto_command_windows_cover_every_day(env, last):
+    import json
+    from datetime import timedelta
+
+    from clients.nats.handlers.parse_run import ParseRunHandler
+    from core.schemas.messaging import ParseCommand
+
+    env.pages.get_last_stat_date.side_effect = None
+    env.pages.get_last_stat_date.return_value = last
+    env.search.get_last_stat_date.return_value = last
+    body = {
+        "schema_version": 1,
+        "occurred_at": "2026-10-26T00:00:03Z",
+        "job_id": str(uuid4()),
+        "provider": "ya_metrica",
+        "equestrian_id": str(env.eq),
+        "trigger": "schedule",
+        "window": {"mode": "auto"},
+        "params": {},
+    }
+    await ParseRunHandler(service=env.service).handle(payload=json.dumps(body).encode())
+    run, tasks = env.runs.create_run_with_tasks.call_args.args
+    assert run.job_id == ParseCommand.model_validate(body).job_id
+    assert run.date_mode == "auto"
+    assert not run.clamped
+    lower, today = date(2024, 10, 26), date(2026, 10, 26)
+    start = max(last, lower) if last is not None else lower
+    assert set(task.kind for task in tasks) == set(ParseKind)
+    for kind in ParseKind:
+        windows = [task for task in tasks if task.kind == kind]
+        assert windows[0].date_from == start
+        assert windows[-1].date_to == today
+        cursor = start
+        for task in windows:
+            assert task.status == "queued"
+            assert task.date_from == cursor
+            assert 1 <= (task.date_to - task.date_from).days + 1 <= 5
+            cursor = task.date_to + timedelta(days=1)
+        assert cursor == today + timedelta(days=1)
+        if last == date(2026, 10, 25):
+            assert len(windows) == 1
+            assert (windows[0].date_to - windows[0].date_from).days == 1
+    env.dispatcher.dispatch_account.assert_awaited_once_with(env.account)

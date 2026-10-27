@@ -73,8 +73,8 @@ def test_revision_is_frozen_and_has_expected_head():
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(Config(str(ENV_PATH.parents[1] / "alembic.ini")))
-    assert script.get_current_head() == "20261026_0002"
-    revision = script.get_revision("head")
+    assert script.get_current_head() == "20261028_0003"
+    revision = script.get_revision("20261026_0002")
     assert revision.down_revision == "20260710_0001"
     tables = revision.module.revision_metadata.tables
     assert set(tables) == {
@@ -128,3 +128,33 @@ def test_domain_entities_and_invariants():
     assert row.parse_task_id is None
     with pytest.raises(ValidationError, match="Bounces"):
         StatRow(**{**row.model_dump(), "bounces": 4})
+
+
+def test_job_id_revision_upgrade_downgrade_and_model_match():
+    from io import StringIO
+
+    from alembic.config import Config
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from alembic.script import ScriptDirectory
+    from sqlalchemy.dialects.postgresql import UUID
+
+    from models import metrica_parse_runs
+
+    script = ScriptDirectory.from_config(Config(str(ENV_PATH.parents[1] / "alembic.ini")))
+    revision = script.get_revision("head")
+    assert revision.down_revision == "20261026_0002"
+    output = StringIO()
+    context = MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output})
+    with Operations.context(context):
+        revision.module.upgrade()
+        revision.module.downgrade()
+    ddl = output.getvalue()
+    assert "ADD COLUMN job_id UUID" in ddl
+    assert "CREATE UNIQUE INDEX ux_metrica_parse_runs_job_id ON metrica_parse_runs (job_id)" in ddl
+    assert "DROP INDEX ux_metrica_parse_runs_job_id" in ddl
+    assert "DROP COLUMN job_id" in ddl
+    column = metrica_parse_runs.c.job_id
+    assert column.nullable and isinstance(column.type, UUID)
+    index = next(index for index in metrica_parse_runs.indexes if index.name == "ux_metrica_parse_runs_job_id")
+    assert index.unique and list(index.columns) == [column]

@@ -1,12 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from settings import CelerySettings, Settings
+from settings import CelerySettings, NatsSettings, Settings
 
 
 @pytest.fixture(autouse=True)
 def isolated_environment(clean_settings_env, monkeypatch):
-    for model in (Settings, CelerySettings):
+    for model in (Settings, CelerySettings, NatsSettings):
         for field in model.model_fields.values():
             monkeypatch.delenv(field.alias, raising=False)
 
@@ -217,3 +217,68 @@ def test_celery_constructor_accepts_canonical_names_and_aliases(use_aliases):
 def test_canonical_celery_url_is_validated_not_silently_ignored():
     with pytest.raises(ValidationError, match="database 5"):
         CelerySettings(_env_file=None, redis_password="synthetic", celery_app_broker="redis://localhost:6379/3")
+
+
+def test_nats_defaults():
+    settings = NatsSettings(_env_file=None)
+    assert settings.nats_servers == ["nats://eqsitecms-nats:4222"]
+    assert settings.nats_stream_parse_commands == "PARSE_COMMANDS"
+    assert settings.nats_subject_parse_run == "commands.parse.ya_metrica.run"
+    assert settings.nats_consumer_parse_run == "ya-metrica-parse-run"
+    assert settings.nats_consumer_ack_wait_seconds == 30
+    assert settings.nats_consumer_max_deliver == 5
+    assert settings.nats_consumer_fetch_batch_size == 1
+    assert settings.nats_consumer_fetch_timeout_seconds == 5
+    assert settings.nats_setup_max_attempts == 10
+    assert settings.nats_setup_backoff_seconds == 2
+    assert settings.nats_error_report_after_attempts == 3
+
+
+def test_nats_all_environment_aliases(monkeypatch):
+    values = {
+        "NATS_SERVERS": (
+            " nats://one:4222, nats://two:4222 ",
+            "nats_servers_raw",
+            " nats://one:4222, nats://two:4222 ",
+        ),
+        "NATS_STREAM_PARSE_COMMANDS": ("CUSTOM", "nats_stream_parse_commands", "CUSTOM"),
+        "NATS_SUBJECT_PARSE_RUN": ("custom.run", "nats_subject_parse_run", "custom.run"),
+        "NATS_CONSUMER_PARSE_RUN": ("custom-run", "nats_consumer_parse_run", "custom-run"),
+        "NATS_CONSUMER_ACK_WAIT_SECONDS": ("60", "nats_consumer_ack_wait_seconds", 60),
+        "NATS_CONSUMER_MAX_DELIVER": ("8", "nats_consumer_max_deliver", 8),
+        "NATS_CONSUMER_FETCH_BATCH_SIZE": ("2", "nats_consumer_fetch_batch_size", 2),
+        "NATS_CONSUMER_FETCH_TIMEOUT_SECONDS": ("7", "nats_consumer_fetch_timeout_seconds", 7),
+        "NATS_SETUP_MAX_ATTEMPTS": ("4", "nats_setup_max_attempts", 4),
+        "NATS_SETUP_BACKOFF_SECONDS": ("0.5", "nats_setup_backoff_seconds", 0.5),
+        "NATS_ERROR_REPORT_AFTER_ATTEMPTS": ("6", "nats_error_report_after_attempts", 6),
+    }
+    for alias, (raw, _, _) in values.items():
+        monkeypatch.setenv(alias, raw)
+    settings = NatsSettings(_env_file=None)
+    for _, field, expected in values.values():
+        assert getattr(settings, field) == expected
+    assert settings.nats_servers == ["nats://one:4222", "nats://two:4222"]
+
+
+@pytest.mark.parametrize(
+    "alias,value",
+    [
+        ("NATS_SERVERS", ""),
+        ("NATS_SERVERS", " , "),
+        ("NATS_SERVERS", "http://host"),
+        ("NATS_SERVERS", "nats://host:bad"),
+        ("NATS_STREAM_PARSE_COMMANDS", ""),
+        ("NATS_SUBJECT_PARSE_RUN", ""),
+        ("NATS_CONSUMER_PARSE_RUN", ""),
+        ("NATS_CONSUMER_ACK_WAIT_SECONDS", "0"),
+        ("NATS_CONSUMER_MAX_DELIVER", "0"),
+        ("NATS_CONSUMER_FETCH_BATCH_SIZE", "0"),
+        ("NATS_CONSUMER_FETCH_TIMEOUT_SECONDS", "0"),
+        ("NATS_SETUP_MAX_ATTEMPTS", "0"),
+        ("NATS_SETUP_BACKOFF_SECONDS", "-1"),
+        ("NATS_ERROR_REPORT_AFTER_ATTEMPTS", "0"),
+    ],
+)
+def test_nats_invalid_configuration(alias, value):
+    with pytest.raises(ValidationError):
+        NatsSettings(_env_file=None, **{alias: value})

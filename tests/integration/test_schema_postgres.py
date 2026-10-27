@@ -41,7 +41,7 @@ async def test_it_ms_01_upgrade_downgrade_upgrade(pg_schema_engine):
         assert set(await connection.run_sync(lambda conn: inspect(conn).get_table_names())) == TABLES | {
             "alembic_version"
         }
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "20261026_0002"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "20261028_0003"
         assert (
             await connection.run_sync(lambda conn: compare_metadata(MigrationContext.configure(conn), metadata)) == []
         )

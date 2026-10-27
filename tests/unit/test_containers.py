@@ -145,3 +145,64 @@ def test_page_stats_graph_is_request_scoped_and_lazy():
     assert first._repository.session is second._repository.session is session
     assert create_page_stats_services(other_session).page_stats_query_service()._repository.session is other_session
     assert repositories_container.session.overridden == original
+
+
+def test_nats_di_is_lazy_and_shares_settings():
+    from containers.application import nats_client_provider, parse_run_consumer_provider
+    from settings import NatsSettings
+
+    settings = settings_container.nats_settings()
+    assert isinstance(settings, NatsSettings)
+    assert settings_container.nats_settings() is settings
+    client = nats_client_provider()
+    consumer = parse_run_consumer_provider()
+    assert nats_client_provider() is client
+    assert consumer._client is client
+    assert client._settings is consumer._settings is settings
+    assert not client.is_connected
+    assert not consumer.is_running
+
+
+async def test_delivery_handler_owns_fresh_graph_session_and_cleans_errors(monkeypatch):
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from containers import application
+
+    sessions, closed = [], []
+    graphs = []
+
+    @asynccontextmanager
+    async def session_scope():
+        session = MagicMock()
+        sessions.append(session)
+        try:
+            yield session
+        finally:
+            closed.append(session)
+
+    def graph_factory(session):
+        graph = MagicMock()
+        graph.parse_enqueue_service.return_value = session
+        graphs.append(graph)
+        return graph
+
+    handler = AsyncMock()
+    factory = MagicMock(return_value=handler)
+    monkeypatch.setattr(application, "worker_session", session_scope)
+    monkeypatch.setattr(application, "create_parse_services", graph_factory)
+    monkeypatch.setattr(application, "ParseRunHandler", factory)
+    delivery = application.parse_run_handler_provider()
+    original = repositories_container.session.overridden
+    await delivery.handle(payload=b"one", headers=None, subject="actual")
+    handler.handle.side_effect = RuntimeError()
+    with pytest.raises(RuntimeError):
+        await delivery.handle(payload=b"two", headers={"X-Equestrian-Id": "ignored"}, subject="other")
+    assert len(graphs) == len(sessions) == 2
+    assert sessions[0] is not sessions[1]
+    assert closed == sessions
+    assert [call.kwargs["service"] for call in factory.call_args_list] == sessions
+    assert handler.handle.await_args.kwargs["subject"] == "other"
+    assert repositories_container.session.overridden == original

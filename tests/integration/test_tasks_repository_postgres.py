@@ -292,3 +292,140 @@ async def test_retry_checkpoint_and_lease_fencing(pg_session):
     )
     row = await task_row(pg_session, task.id)
     assert row["attempts"] == 2 and row["status"] == "failed" and row["finished_at"] is not None
+
+
+@pytest.mark.infrastructure
+async def test_it_mp_01_migration_preserves_legacy_rows(pg_schema_engine):
+    from pathlib import Path
+
+    from alembic.autogenerate import compare_metadata
+    from alembic.config import Config
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import inspect, text
+
+    from utils.basemodel import metadata
+
+    script = ScriptDirectory.from_config(Config(str(Path(__file__).parents[2] / "src" / "alembic.ini")))
+
+    def migrate(connection, target, *, downgrade=False):
+        def steps(revision, context):
+            return script._downgrade_revs(target, revision) if downgrade else script._upgrade_revs(target, revision)
+
+        context = MigrationContext.configure(connection, opts={"fn": steps})
+        with Operations.context(context), context.begin_transaction():
+            context.run_migrations()
+
+    legacy, tasks = run_tasks()
+    async with pg_schema_engine.begin() as connection:
+        await connection.run_sync(lambda conn: migrate(conn, "20261026_0002"))
+        # Use the frozen revision, whose run table deliberately has no job_id.
+        frozen = script.get_revision("20261026_0002").module
+        await connection.execute(frozen.metrica_parse_runs.insert().values(legacy.model_dump(exclude={"job_id"})))
+        for task in tasks:
+            await connection.execute(frozen.metrica_parse_tasks.insert().values(task.model_dump(exclude_none=True)))
+        await connection.execute(
+            frozen.metrica_page_stats.insert().values(
+                id=uuid4(),
+                equestrian_id=legacy.equestrian_id,
+                stat_date=DAY,
+                page_id=uuid4(),
+                visits=3,
+                users=2,
+                pageviews=4,
+                bounces=1,
+                visit_duration_seconds=30,
+                parse_task_id=tasks[0].id,
+            )
+        )
+        task_rows = (await connection.execute(select(frozen.metrica_parse_tasks))).mappings().all()
+        stat_rows = (await connection.execute(select(metrica_page_stats))).mappings().all()
+        await connection.run_sync(lambda conn: migrate(conn, "head"))
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "20261028_0003"
+        runs = (await connection.execute(select(metrica_parse_runs))).mappings().all()
+        assert len(runs) == 1 and runs[0]["job_id"] is None
+        assert ParseRun.model_validate(runs[0]).id == legacy.id
+        assert (await connection.execute(select(metrica_parse_tasks))).mappings().all() == task_rows
+        assert (await connection.execute(select(metrica_page_stats))).mappings().all() == stat_rows
+        assert (
+            await connection.run_sync(lambda conn: compare_metadata(MigrationContext.configure(conn), metadata)) == []
+        )
+        for _ in range(2):
+            extra, _ = run_tasks()
+            await connection.execute(metrica_parse_runs.insert().values(extra.model_dump()))
+        await connection.run_sync(lambda conn: migrate(conn, "20261026_0002", downgrade=True))
+        columns = await connection.run_sync(lambda conn: inspect(conn).get_columns("metrica_parse_runs"))
+        assert "job_id" not in {column["name"] for column in columns}
+        assert await connection.scalar(select(func.count()).select_from(frozen.metrica_parse_runs)) == 3
+        assert (await connection.execute(select(metrica_parse_tasks))).mappings().all() == task_rows
+        assert (await connection.execute(select(metrica_page_stats))).mappings().all() == stat_rows
+        await connection.run_sync(lambda conn: migrate(conn, "head"))
+        assert await connection.scalar(select(func.count()).select_from(metrica_parse_runs)) == 3
+
+
+@pytest.mark.infrastructure
+async def test_it_mp_01_duplicate_and_active_are_distinct(pg_session):
+    from core.exceptions.parse import ParseJobAlreadyExistsError
+
+    repository = ParseRunRepository(pg_session)
+    job_id = uuid4()
+    assert not await repository.exists_job(job_id)
+    first, tasks = run_tasks()
+    first.job_id = job_id
+    assert await repository.create_run_with_tasks(first, tasks)
+    assert await repository.exists_job(job_id)
+    # Duplicate wins over the active-run outcome for the same equestrian.
+    repeat, repeated_tasks = run_tasks(eq=first.equestrian_id)
+    repeat.job_id = job_id
+    with pytest.raises(ParseJobAlreadyExistsError):
+        await repository.create_run_with_tasks(repeat, repeated_tasks)
+    repeat.job_id = uuid4()
+    assert await repository.create_run_with_tasks(repeat, repeated_tasks) is False
+    # Key remains effective after the original run has finished, even across equestrians.
+    await pg_session.execute(update(metrica_parse_tasks).values(status="succeeded"))
+    repeat, repeated_tasks = run_tasks()
+    repeat.job_id = job_id
+    with pytest.raises(ParseJobAlreadyExistsError):
+        await repository.create_run_with_tasks(repeat, repeated_tasks)
+    assert await pg_session.scalar(select(func.count()).select_from(metrica_parse_runs)) == 1
+    assert await pg_session.scalar(select(func.count()).select_from(metrica_parse_tasks)) == len(tasks)
+    # NULL keys remain repeatable for independent legacy runs.
+    await enqueue(pg_session)
+    await enqueue(pg_session)
+
+
+@pytest.mark.infrastructure
+@pytest.mark.parametrize("same_equestrian", [True, False])
+async def test_it_mp_01_concurrent_job_conflict(pg_engine, same_equestrian):
+    from core.exceptions.parse import ParseJobAlreadyExistsError
+
+    job_id, eq = uuid4(), uuid4()
+    inserted, second_started = asyncio.Event(), asyncio.Event()
+
+    async def first():
+        async with AsyncSession(pg_engine) as session:
+            run, tasks = run_tasks(eq=eq)
+            run.job_id = job_id
+            assert await ParseRunRepository(session).create_run_with_tasks(run, tasks)
+            inserted.set()
+            await second_started.wait()
+            await asyncio.sleep(0.1)
+            await session.commit()
+
+    async def second():
+        await inserted.wait()
+        async with AsyncSession(pg_engine) as session:
+            run, tasks = run_tasks(eq=eq if same_equestrian else uuid4())
+            run.job_id = job_id
+            second_started.set()
+            with pytest.raises(ParseJobAlreadyExistsError):
+                await ParseRunRepository(session).create_run_with_tasks(run, tasks)
+            # ON CONFLICT must not leave the session in a failed transaction.
+            assert await session.scalar(select(func.count()).select_from(metrica_parse_runs)) == 1
+            await session.commit()
+
+    await asyncio.wait_for(asyncio.gather(first(), second()), timeout=10)
+    async with AsyncSession(pg_engine) as session:
+        assert await session.scalar(select(func.count()).select_from(metrica_parse_runs)) == 1
+        assert await session.scalar(select(func.count()).select_from(metrica_parse_tasks)) == 2

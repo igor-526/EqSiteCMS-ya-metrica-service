@@ -96,4 +96,43 @@ class CelerySettings(BaseSettings):
         return self
 
 
+class NatsSettings(BaseSettings):
+    nats_servers_raw: str = Field(default="nats://eqsitecms-nats:4222", alias="NATS_SERVERS", repr=False)
+    nats_stream_parse_commands: str = Field(default="PARSE_COMMANDS", alias="NATS_STREAM_PARSE_COMMANDS", min_length=1)
+    nats_subject_parse_run: str = Field(
+        default="commands.parse.ya_metrica.run", alias="NATS_SUBJECT_PARSE_RUN", min_length=1
+    )
+    nats_consumer_parse_run: str = Field(default="ya-metrica-parse-run", alias="NATS_CONSUMER_PARSE_RUN", min_length=1)
+    nats_consumer_ack_wait_seconds: float = Field(default=30, alias="NATS_CONSUMER_ACK_WAIT_SECONDS", gt=0)
+    nats_consumer_max_deliver: int = Field(default=5, alias="NATS_CONSUMER_MAX_DELIVER", ge=1)
+    nats_consumer_fetch_batch_size: int = Field(default=1, alias="NATS_CONSUMER_FETCH_BATCH_SIZE", ge=1)
+    nats_consumer_fetch_timeout_seconds: float = Field(default=5, alias="NATS_CONSUMER_FETCH_TIMEOUT_SECONDS", gt=0)
+    nats_setup_max_attempts: int = Field(default=10, alias="NATS_SETUP_MAX_ATTEMPTS", ge=1)
+    nats_setup_backoff_seconds: float = Field(default=2, alias="NATS_SETUP_BACKOFF_SECONDS", ge=0)
+    nats_error_report_after_attempts: int = Field(default=3, alias="NATS_ERROR_REPORT_AFTER_ATTEMPTS", ge=1)
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True, populate_by_name=True
+    )
+
+    @property
+    def nats_servers(self) -> list[str]:
+        return [server.strip() for server in self.nats_servers_raw.split(",") if server.strip()]
+
+    @model_validator(mode="after")
+    def validate_servers(self) -> NatsSettings:
+        if not self.nats_servers:
+            raise ValueError("NATS_SERVERS must not be empty")
+        for server in self.nats_servers:
+            try:
+                url = urlsplit(server)
+                valid = url.scheme in {"nats", "tls", "ws", "wss"} and bool(url.hostname)
+                _ = url.port
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("NATS_SERVERS must contain valid NATS URLs")
+        return self
+
+
 settings = Settings()

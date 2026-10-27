@@ -41,6 +41,7 @@ class ParseErrorCode(StrEnum):
 
 
 class ParseRun(Entity):
+    job_id: UUID | None = None
     equestrian_id: UUID
     date_mode: DateMode
     clamped: bool = False

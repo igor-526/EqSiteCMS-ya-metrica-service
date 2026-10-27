@@ -1,12 +1,14 @@
 import logging
 from contextlib import AbstractAsyncContextManager
 from typing import Protocol
+from uuid import UUID
 
 from core.entities.metrica_parse import ParseKind, ParseRun, ParseTask
 from core.exceptions import PeerServiceException
 from core.exceptions.parse import (
     MetricaBindingMissingError,
     ParseAlreadyActiveError,
+    ParseJobAlreadyExistsError,
     YandexIntegrationUnavailableError,
 )
 from core.protocols.clients.yandex_service import YandexServiceClientProtocol
@@ -51,7 +53,7 @@ class ParseEnqueueService:
         self._dispatcher = dispatcher
         self._max_attempts = max_attempts
 
-    async def enqueue(self, *, data: ParseEnqueueInDto) -> ParseEnqueueOutDto:
+    async def enqueue(self, *, data: ParseEnqueueInDto, job_id: UUID | None = None) -> ParseEnqueueOutDto:
         try:
             binding = await self._yandex_client.get_metrica_binding(equestrian_id=data.equestrian_id)
         except PeerServiceException:
@@ -63,6 +65,8 @@ class ParseEnqueueService:
             raise YandexIntegrationUnavailableError()
         async with self._transaction.begin():
             await self._runs.lock_equestrian(data.equestrian_id)
+            if job_id is not None and await self._runs.exists_job(job_id):
+                raise ParseJobAlreadyExistsError()
             if await self._runs.has_active_tasks(data.equestrian_id):
                 raise ParseAlreadyActiveError()
             last_dates = {}
@@ -70,7 +74,12 @@ class ParseEnqueueService:
                 for kind, repository in self._stats.items():
                     last_dates[kind] = await repository.get_last_stat_date(data.equestrian_id)
             resolved = self._resolver.resolve(date_from=data.date_from, date_to=data.date_to, last_dates=last_dates)
-            run = ParseRun(equestrian_id=data.equestrian_id, date_mode=resolved.date_mode, clamped=resolved.clamped)
+            run = ParseRun(
+                equestrian_id=data.equestrian_id,
+                job_id=job_id,
+                date_mode=resolved.date_mode,
+                clamped=resolved.clamped,
+            )
             windows = self._decomposer.decompose(resolved.ranges)
             tasks = [
                 ParseTask(

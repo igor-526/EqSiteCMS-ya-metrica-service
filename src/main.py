@@ -1,16 +1,20 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.responses import JSONResponse
+from nats.js.errors import BadRequestError
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from api import page_stats_router, yandex_metrica, yandex_metrica_router
-from api.parse import router as parse_router
 from api.search_query_stats import router as search_query_stats_router
+from clients.nats.client import NatsJetstreamClient
+from clients.nats.consumers.parse_run import ParseRunConsumer
 from containers import services_container
+from containers.application import nats_client_provider, parse_run_consumer_provider
 from core.exceptions import AppError
 from settings import settings
 from utils.configure_sentry import configure_sentry
@@ -19,10 +23,47 @@ from utils.database import close_database
 configure_sentry()
 
 
+async def supervise_nats(client: NatsJetstreamClient, consumer: ParseRunConsumer) -> None:
+    backoff = 1.0
+    while True:
+        try:
+            await client.connect()
+            await client.setup()
+            await consumer.start()
+            backoff = 1.0
+            await consumer.wait()
+        except asyncio.CancelledError:
+            raise
+        except BadRequestError:
+            # Incompatible durable configuration is not a deployment race.
+            logger.error("NATS consumer configuration rejected; supervisor stopped")
+            return
+        except Exception as error:
+            await client.error_policy.on_error(error)
+        finally:
+            try:
+                await consumer.stop()
+            finally:
+                await client.close()
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
-    await close_database()
+    task = asyncio.create_task(
+        supervise_nats(nats_client_provider(), parse_run_consumer_provider()), name="metrica-nats-supervisor"
+    )
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await close_database()
 
 
 services_container.wire(
@@ -67,7 +108,6 @@ app.add_middleware(SafeUnexpectedErrorMiddleware)
 
 router = APIRouter(prefix="/api")
 router.include_router(yandex_metrica_router, prefix="/metrica", tags=["Yandex Metrica"])
-router.include_router(parse_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(page_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(search_query_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
 app.include_router(router)

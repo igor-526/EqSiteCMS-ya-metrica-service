@@ -1,0 +1,92 @@
+asyncapi: 2.6.0
+info:
+  title: EqSiteCMS Ya Metrica Parse Commands
+  version: 1.0.0
+  description: >-
+    Входящие команды seo-service. Доступ — доверенная внутренняя сеть без NATS auth;
+    production требует отдельно подтверждённой сетевой изоляции. Секреты не передаются.
+servers:
+  jetstream:
+    url: nats://eqsitecms-nats:4222
+    protocol: nats
+channels:
+  commands.parse.ya_metrica.run:
+    x-jetstream-stream: PARSE_COMMANDS
+    x-jetstream-stream-config:
+      owner: seo-service
+      subjects: [commands.parse.>]
+      storage: file
+      retention: limits
+      max-age-seconds: 604800
+    x-jetstream-consumer:
+      durable: ya-metrica-parse-run
+      filter-subject: commands.parse.ya_metrica.run
+      deliver-policy: all
+      ack-policy: explicit
+      ack-wait-seconds: 30
+      max-deliver: 5
+    subscribe:
+      operationId: consumeMetricaParseRun
+      description: >-
+        Success, duplicate job_id, active run, missing binding, invalid date range → ack.
+        Invalid envelope/provider/subject → term. Integration/storage failures → nak.
+        Consumer registers durable only; seo-service creates the stream.
+      message:
+        $ref: '#/components/messages/ParseCommand'
+components:
+  messages:
+    ParseCommand:
+      name: ParseCommand
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/IdempotencyHeaders'
+      payload:
+        $ref: '#/components/schemas/ParseCommandPayload'
+  schemas:
+    IdempotencyHeaders:
+      type: object
+      required: [Nats-Msg-Id]
+      description: >-
+        NAMESPACE_PARSE_COMMANDS = uuid5(NAMESPACE_DNS, "parse-commands.eqcms").
+        Nats-Msg-Id = uuid5(NAMESPACE_PARSE_COMMANDS, "<provider>:<job_id>"),
+        уникален в stream. Дополнительные транспортные заголовки допустимы.
+      properties:
+        Nats-Msg-Id: {type: string, format: uuid}
+    ParseCommandPayload:
+      type: object
+      additionalProperties: false
+      required: [schema_version, occurred_at, job_id, provider, equestrian_id, trigger, window, params]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        occurred_at: {type: string, format: date-time}
+        job_id:
+          type: string
+          format: uuid
+          description: >-
+            manual — uuid4(); schedule — uuid5(NAMESPACE_PARSE_COMMANDS,
+            "schedule:<provider>:<equestrian_id>:<локальная дата слота>").
+        provider: {type: string, enum: [ya_metrica]}
+        equestrian_id: {type: string, format: uuid}
+        trigger: {type: string, enum: [schedule, manual]}
+        window:
+          oneOf:
+            - $ref: '#/components/schemas/AutoWindow'
+            - $ref: '#/components/schemas/ExplicitWindow'
+        params:
+          type: object
+          additionalProperties: false
+          description: Для ya_metrica допустим только пустой объект.
+    AutoWindow:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [auto]}
+    ExplicitWindow:
+      type: object
+      additionalProperties: false
+      required: [mode, date_from, date_to]
+      properties:
+        mode: {type: string, enum: [explicit]}
+        date_from: {type: string, format: date}
+        date_to: {type: string, format: date}

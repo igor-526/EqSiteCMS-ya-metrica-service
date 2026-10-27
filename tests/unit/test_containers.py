@@ -125,3 +125,23 @@ def test_celery_di_singleton_and_cli_entrypoint(monkeypatch):
         finally:
             first.close()
             celery_app_provider.reset()
+
+
+def test_page_stats_graph_is_request_scoped_and_lazy():
+    from unittest.mock import MagicMock
+
+    from containers.application import create_page_stats_services
+    from core.services.page_stats_query_service import PageStatsQueryService
+    from repositories.page_stats_query_repository import PageStatsQueryRepository
+
+    session, other_session = MagicMock(), MagicMock()
+    original = repositories_container.session.overridden
+    graph = create_page_stats_services(session)
+    first, second = graph.page_stats_query_service(), graph.page_stats_query_service()
+    assert isinstance(first, PageStatsQueryService)
+    assert isinstance(first._repository, PageStatsQueryRepository)
+    assert first is not second
+    assert first._repository is not second._repository
+    assert first._repository.session is second._repository.session is session
+    assert create_page_stats_services(other_session).page_stats_query_service()._repository.session is other_session
+    assert repositories_container.session.overridden == original

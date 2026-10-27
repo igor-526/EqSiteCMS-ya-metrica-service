@@ -32,3 +32,9 @@ def create_parse_services(session: AsyncSession) -> ServicesContainer:
         repositories_container=repositories,
         celery_app=celery_app_provider,
     )
+
+
+def create_page_stats_services(session: AsyncSession) -> ServicesContainer:
+    """Request-local read graph; unrelated clients and workers stay lazy."""
+    repositories = RepositoriesContainer(session=providers.Object(session))
+    return ServicesContainer(repositories_container=repositories)

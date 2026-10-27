@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from api import yandex_metrica, yandex_metrica_router
+from api import page_stats_router, yandex_metrica, yandex_metrica_router
 from api.parse import router as parse_router
 from containers import services_container
 from core.exceptions import AppError
@@ -67,6 +67,7 @@ app.add_middleware(SafeUnexpectedErrorMiddleware)
 router = APIRouter(prefix="/api")
 router.include_router(yandex_metrica_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(parse_router, prefix="/metrica", tags=["Yandex Metrica"])
+router.include_router(page_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
 app.include_router(router)
 
 

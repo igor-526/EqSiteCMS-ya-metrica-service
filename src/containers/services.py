@@ -14,6 +14,7 @@ from core.services import (
     TaskRunner,
     YandexMetricaService,
 )
+from core.services.page_stats_query_service import PageStatsQueryService
 from workers.dispatcher import CeleryParseDispatcher
 
 
@@ -82,4 +83,8 @@ class ServicesContainer(containers.DeclarativeContainer):
         decomposer=decomposer,
         dispatcher=parse_dispatcher,
         max_attempts=settings_container.app_settings.provided.task_max_attempts,
+    )
+
+    page_stats_query_service = providers.Factory(
+        PageStatsQueryService, repository=repositories_container.page_stats_query_repository
     )

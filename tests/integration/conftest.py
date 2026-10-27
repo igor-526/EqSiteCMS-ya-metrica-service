@@ -1,12 +1,13 @@
 """Real PostgreSQL only; never fall back to application database settings."""
 
+import logging
 import os
 import re
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -36,7 +37,7 @@ async def pg_schema_engine() -> AsyncIterator[AsyncEngine]:
         yield engine
     finally:
         await engine.dispose()
-        if created:
+        if created and os.environ.get("TEST_KEEP_SCHEMA") != "1":
             # Only the generated schema can ever be removed; no public/workspace data.
             assert re.fullmatch(r"test_metrica_[0-9a-f]{32}", schema)
             async with admin.begin() as connection:
@@ -56,3 +57,21 @@ async def pg_session(pg_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     async with AsyncSession(pg_engine) as session:
         yield session
         await session.rollback()
+
+
+@pytest.fixture
+def sql_statements(pg_engine, caplog):
+    """Count statements during the measured call; never log bind values."""
+    statements: list[str] = []
+    logger = logging.getLogger("tests.page_stats.sql")
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+        logger.info("SQL: %s", statement)
+
+    event.listen(pg_engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        yield statements
+    finally:
+        event.remove(pg_engine.sync_engine, "before_cursor_execute", capture)

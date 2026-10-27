@@ -6,6 +6,7 @@ from repositories.metrica_parse_run_repository import ParseRunRepository
 from repositories.metrica_parse_task_repository import ParseTaskRepository
 from repositories.metrica_stats_repository import StatsRepository
 from repositories.page_stats_query_repository import PageStatsQueryRepository
+from repositories.search_query_stats_query_repository import SearchQueryStatsQueryRepository
 
 
 class RepositoriesContainer(containers.DeclarativeContainer):
@@ -17,3 +18,5 @@ class RepositoriesContainer(containers.DeclarativeContainer):
     search_queries_repository = providers.Factory(StatsRepository, session=session, kind=ParseKind.SEARCH_QUERIES)
 
     page_stats_query_repository = providers.Factory(PageStatsQueryRepository, session=session)
+
+    search_query_stats_query_repository = providers.Factory(SearchQueryStatsQueryRepository, session=session)

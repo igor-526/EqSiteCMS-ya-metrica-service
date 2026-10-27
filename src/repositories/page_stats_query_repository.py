@@ -4,28 +4,18 @@ from collections.abc import Sequence
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy import Date, Numeric, any_, bindparam, case, cast, column, func, select
+from sqlalchemy import Date, any_, bindparam, column, func, select
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql.elements import ColumnElement
 
 from core.entities.metrica_stats_query import Direction, Metric, PageStatsValue, StatsBucket
 from models import metrica_page_stats
 
+from ._stats_metric_expressions import ADDITIVE_METRICS, metric_expressions
+
 _stats = metrica_page_stats.c
-_visits = func.sum(_stats.visits)
-# Only these expressions can enter SQL; never interpolate a request value.
-ADDITIVE_METRICS = (Metric.VISITS, Metric.USERS, Metric.PAGEVIEWS, Metric.BOUNCES, Metric.VISIT_DURATION_SECONDS)
-METRIC_EXPRESSIONS: dict[Metric, ColumnElement] = {
-    metric: func.sum(_stats[metric.value]) for metric in ADDITIVE_METRICS
-}
-for _metric, _numerator in (
-    (Metric.BOUNCE_RATE, func.sum(_stats.bounces) * 100),
-    (Metric.PAGE_DEPTH, func.sum(_stats.pageviews)),
-    (Metric.AVG_VISIT_DURATION_SECONDS, func.sum(_stats.visit_duration_seconds)),
-):
-    METRIC_EXPRESSIONS[_metric] = case((_visits > 0, func.round(cast(_numerator, Numeric) / _visits, 8)), else_=0)
+METRIC_EXPRESSIONS = metric_expressions(metrica_page_stats)
 
 
 class PageStatsQueryRepository:

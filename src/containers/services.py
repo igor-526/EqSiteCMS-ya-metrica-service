@@ -15,6 +15,7 @@ from core.services import (
     YandexMetricaService,
 )
 from core.services.page_stats_query_service import PageStatsQueryService
+from core.services.search_query_stats_query_service import SearchQueryStatsQueryService
 from workers.dispatcher import CeleryParseDispatcher
 
 
@@ -87,4 +88,8 @@ class ServicesContainer(containers.DeclarativeContainer):
 
     page_stats_query_service = providers.Factory(
         PageStatsQueryService, repository=repositories_container.page_stats_query_repository
+    )
+
+    search_query_stats_query_service = providers.Factory(
+        SearchQueryStatsQueryService, repository=repositories_container.search_query_stats_query_repository
     )

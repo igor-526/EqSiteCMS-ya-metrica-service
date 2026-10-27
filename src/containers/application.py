@@ -38,3 +38,9 @@ def create_page_stats_services(session: AsyncSession) -> ServicesContainer:
     """Request-local read graph; unrelated clients and workers stay lazy."""
     repositories = RepositoriesContainer(session=providers.Object(session))
     return ServicesContainer(repositories_container=repositories)
+
+
+def create_search_query_stats_services(session: AsyncSession) -> ServicesContainer:
+    """Request-local query read graph; no workers, external clients or commits."""
+    repositories = RepositoriesContainer(session=providers.Object(session))
+    return ServicesContainer(repositories_container=repositories)

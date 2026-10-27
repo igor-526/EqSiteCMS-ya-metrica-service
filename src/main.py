@@ -9,6 +9,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from api import page_stats_router, yandex_metrica, yandex_metrica_router
 from api.parse import router as parse_router
+from api.search_query_stats import router as search_query_stats_router
 from containers import services_container
 from core.exceptions import AppError
 from settings import settings
@@ -68,6 +69,7 @@ router = APIRouter(prefix="/api")
 router.include_router(yandex_metrica_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(parse_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(page_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
+router.include_router(search_query_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
 app.include_router(router)
 
 

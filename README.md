@@ -12,6 +12,8 @@ PostgreSQL, Alembic, Celery/Redis; Sentry опционален.
 | M2 | POST | `/api/metrica/stats/parse` | Private Peer Write exception; внутренний сервис | 200 / ошибка 400 | то же |
 | M3 | GET | `/api/metrica/page-stats/table` | Private Peer Read exception; seo-service | 200 / ошибка 400 | то же |
 | M4 | GET | `/api/metrica/page-stats/ranking` | Private Peer Read exception; seo-service | 200 / ошибка 400 | то же |
+| M5 | GET | `/api/metrica/search-query-stats/table` | Private Peer Read exception; доверенный seo-service | 200 / ошибка 400 | то же |
+| M6 | GET | `/api/metrica/search-query-stats/ranking` | Private Peer Read exception; доверенный seo-service | 200 / ошибка 400 | то же |
 | H1 | GET | `/health` | Public Read; любой | 200 | то же |
 
 M1 получает зашифрованный `access_token` в query, расшифровывает в памяти и
@@ -95,6 +97,64 @@ M4 принимает `date_from/date_to` строго `YYYY-MM-DD`: от 1 до
 Сессия отдельная на запрос, без commit. Границы от SEO передаются без изменений:
 M3/M4 не вычисляют календарные периоды, умолчания или «сегодня», не обрезают
 будущие даты. Указанные выше лимиты — только валидация запроса.
+
+## Чтение статистики поисковых запросов (M5/M6)
+
+M5/M6 — новые private trusted-network peer GET для SEO, без credentials.
+Anonymous, Cookie и Bearer дают одинаковые ответы, роли не проверяются.
+`equestrian_id` — обязательный query UUID ресурса, не selector:
+`X-Equestrian-Id` его не заменяет и не переопределяет. Missing/invalid UUID,
+metric, buckets/IDs/dates/direction → `400`, не `401`. Ошибки БД и обработки
+также дают безопасный `400` без входных значений, SQL, credentials и traceback.
+Успех, включая отсутствие данных, — `200`.
+
+```http
+GET /api/metrica/search-query-stats/table?equestrian_id=00000000-0000-0000-0000-000000000001&metric=page_depth&bucket=2026-10-19..2026-10-25&bucket=2026-10-26..2026-10-26&search_query_ids=00000000-0000-0000-0000-000000000002
+```
+
+```json
+{"metric":"page_depth","values":[{"search_query_id":"00000000-0000-0000-0000-000000000002","bucket":"2026-10-19","value":2.08}]}
+```
+
+M5 принимает те же восемь `metric`, что M3. Повторяемый `bucket`:
+1..31 интервалов строго `YYYY-MM-DD..YYYY-MM-DD`, начало ≤ конца,
+по возрастанию без пересечений; разрывы допустимы. Повторяемый
+`search_query_ids`: 1..100 различных UUID, дубликаты нормализуются и
+схлопываются **до** ограничения. В ответе bucket — начало интервала;
+нет данных — пара опущена (либо `values: []`), реальные нули включены.
+
+```http
+GET /api/metrica/search-query-stats/ranking?equestrian_id=00000000-0000-0000-0000-000000000001&metric=visits&date_from=2026-10-19&date_to=2026-10-25&direction=desc
+```
+
+```json
+{"metric":"visits","direction":"desc","search_query_ids":["00000000-0000-0000-0000-000000000002"]}
+```
+
+M6: все параметры обязательны, `date_from/date_to` строго `YYYY-MM-DD`,
+1..366 дней включительно, `direction=asc|desc`. Возвращаются все UUID
+конюшни с данными диапазона, по числовому агрегату в указанном направлении,
+при равенстве — UUID asc; без данных — `search_query_ids: []`.
+
+Источник обоих маршрутов — только `metrica_search_query_stats`, без JOIN
+parse tasks/pages/counters. Каждый вызов выполняет один SQL независимо от
+размера пакета (в том числе 100×31); Python только отображает готовые rows.
+Суммы visits/users/pageviews/bounces/visit_duration_seconds — целые JSON-числа;
+users означает сумму дневных счётчиков, не уникальных пользователей периода.
+Производные: `SUM(bounces)*100/SUM(visits)`, `SUM(pageviews)/SUM(visits)`,
+`SUM(visit_duration_seconds)/SUM(visits)` соответственно bounce_rate,
+page_depth, avg_visit_duration_seconds; округление до 8 знаков, при нуле
+визитов — 0. Это JSON-числа, не строки; дневные средние не усредняются.
+
+Сессия отдельная на запрос, без commit; завершение read dependency — до
+отправки ответа. Границы используются ровно как передал SEO: нет defaults,
+вычисления календаря/сегодня, поиска, пагинации или in-memory aggregation.
+Парсинг, нормализация и page API не меняются, миграций нет.
+
+**Production isolation gate:** до выпуска отдельно подтвердить внешнюю
+недоступность M5/M6 и БД, доступ только из доверенной сети. Новые порты не
+публикуются. Успешные тесты/live smoke не доказывают изоляцию; существующая
+внешняя доступность блокирует production выпуск, а не исправляется этим unit.
 
 ## Хранение и агрегация
 

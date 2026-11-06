@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from core.entities.metrica_metrics import BASE_METRICS, MetricValues, add_metrics, provider_metrics
 from core.entities.metrica_parse import ParseErrorCode, ParseKind, ParseTask
 from core.entities.metrica_stats import StatRow
 from core.exceptions.peer import PeerServiceException
@@ -20,7 +21,6 @@ from core.services.parse_job_factory import ParseJob
 from core.services.parse_retry_policy import ParseExecutionError
 
 logger = logging.getLogger(__name__)
-METRICS = ("visits", "users", "pageviews", "bounces", "visit_duration_seconds")
 
 
 @dataclass
@@ -37,7 +37,7 @@ class IngestionCounts:
 class ParsedRow:
     stat_date: date
     source: str
-    values: tuple[int, int, int, int, int]
+    values: MetricValues
 
 
 def parse_row(raw: Any, task: ParseTask) -> ParsedRow | None:
@@ -58,10 +58,7 @@ def parse_row(raw: Any, task: ParseTask) -> ParsedRow | None:
             return None
         if any(int(value) != value for value in metrics[:3]) or metrics[3] > 100:
             return None
-        visits, users, pageviews = map(int, metrics[:3])
-        bounces = round(metrics[3] * visits / 100)
-        duration = round(metrics[5] * visits)
-        return ParsedRow(stat_date, source, (visits, users, pageviews, bounces, duration))
+        return ParsedRow(stat_date, source, provider_metrics(metrics))
     except TypeError, ValueError, KeyError, IndexError, OverflowError:
         return None
 
@@ -127,8 +124,18 @@ class StatIngestionService:
             key = row.stat_date, entity_id
             if key in aggregated:
                 existing = aggregated[key]
-                for name, value in zip(METRICS, row.values, strict=True):
-                    setattr(existing, name, getattr(existing, name) + value)
+                values = add_metrics(
+                    (
+                        existing.visits,
+                        existing.users,
+                        existing.pageviews,
+                        existing.bounces,
+                        existing.visit_duration_seconds,
+                    ),
+                    row.values,
+                )
+                for name, value in zip(BASE_METRICS, values, strict=True):
+                    setattr(existing, name, value)
             else:
                 aggregated[key] = StatRow(
                     equestrian_id=task.equestrian_id,
@@ -166,6 +173,8 @@ class StatIngestionService:
             next_offset = offset + len(page.data)
             try:
                 async with self._transaction.begin():
+                    # Lock scope/ownership BEFORE stats locks, held until page commit.
+                    await self._tasks.assert_writable(task.id, locked_by=locked_by)
                     saved = await self._stats[task.kind].upsert(rows)
                     # save_checkpoint fences ownership and renews lease in the SAME transaction.
                     await self._tasks.save_checkpoint(

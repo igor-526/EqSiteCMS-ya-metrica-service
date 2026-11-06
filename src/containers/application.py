@@ -4,12 +4,15 @@ from dependency_injector import providers
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from clients.nats.client import NatsJetstreamClient
+from clients.nats.consumers.maintenance import MaintenanceConsumer
 from clients.nats.consumers.parse_run import ParseRunConsumer
+from clients.nats.handlers.maintenance import MaintenanceHandler
 from clients.nats.handlers.parse_run import ParseRunHandler
 from containers.clients import ClientsContainer
 from containers.repositories import RepositoriesContainer
 from containers.services import ServicesContainer
 from containers.settings import SettingsContainer
+from settings import NatsSettings
 from utils.database import worker_session
 from workers.app_factory import create_celery_app
 
@@ -70,3 +73,31 @@ parse_run_consumer_provider = providers.Singleton(
     settings=settings_container.nats_settings,
     handler=parse_run_handler_provider,
 )
+
+
+class DeliveryMaintenanceHandler:
+    """Fresh session per delivery; service commits inbox+ledger before return."""
+
+    def __init__(self, *, consumer: str) -> None:
+        self._consumer = consumer
+
+    async def handle(self, *, payload: bytes, headers: Mapping[str, str] | None, subject: str) -> None:
+        async with worker_session() as session:
+            repositories = RepositoriesContainer(session=providers.Object(session))
+            graph = ServicesContainer(repositories_container=repositories)
+            handler = MaintenanceHandler(service=graph.maintenance_delivery_service(), consumer=self._consumer)
+            await handler.handle(payload=payload, headers=headers, subject=subject)
+
+
+def create_maintenance_consumers(client: NatsJetstreamClient, settings: NatsSettings) -> list[MaintenanceConsumer]:
+    """Lazy factory; only the opt-in supervised runtime instantiates consumers."""
+    return [
+        MaintenanceConsumer(
+            client=client, settings=settings, route=route, handler=DeliveryMaintenanceHandler(consumer=route[2])
+        )
+        for route in client.maintenance_routes()
+    ]
+
+
+# Dedicated connection: maintenance reconnect/shutdown cannot close the parse transport.
+maintenance_nats_client_provider = providers.Singleton(NatsJetstreamClient, settings=settings_container.nats_settings)

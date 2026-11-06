@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from core.entities import DateMode, ParseKind, ParseRun, StatRow
+from core.entities.metrica_maintenance import BindingLifecycle
 from core.services import ParseEnqueueService, StatIngestionService, TaskRunner
 from repositories.metrica_parse_run_repository import ParseRunRepository
 from repositories.metrica_parse_task_repository import ParseTaskRepository
@@ -20,7 +21,7 @@ def test_enqueue_rejects_nonpositive_attempt_limit():
         ParseEnqueueService(
             yandex_client=Mock(),
             transaction=Mock(),
-            run_repository=Mock(),
+            intent_repository=Mock(),
             pages_repository=Mock(),
             search_queries_repository=Mock(),
             date_resolver=Mock(),
@@ -34,6 +35,7 @@ def test_runner_rejects_nonpositive_lease():
     with pytest.raises(ValueError, match="lease_seconds"):
         TaskRunner(
             task_repository=Mock(),
+            dispatch_service=Mock(),
             pages_repository=Mock(),
             search_queries_repository=Mock(),
             transaction=Mock(),
@@ -93,7 +95,9 @@ async def test_stats_repository_rejects_row_without_task():
 async def test_claim_rejects_invalid_lease_or_owner(lease, owner):
     session = AsyncMock()
     with pytest.raises(ValueError, match="Invalid lease"):
-        await ParseTaskRepository(session).claim(uuid4(), locked_by=owner, lease_seconds=lease)
+        await ParseTaskRepository(session).claim(
+            uuid4(), equestrian_id=uuid4(), lifecycle=BindingLifecycle(1, 0, 0), locked_by=owner, lease_seconds=lease
+        )
     session.execute.assert_not_awaited()
 
 
@@ -127,8 +131,17 @@ async def test_claim_does_not_swallow_unrelated_integrity_failures(state, messag
         yield
 
     session.begin_nested = nested
+    account = uuid4()
+    repo = ParseTaskRepository(session)
+    repo._prepare_parse = AsyncMock(return_value=True)
     with pytest.raises(IntegrityError) as raised:
-        await ParseTaskRepository(session).claim(uuid4(), locked_by="worker", lease_seconds=60)
+        await repo.claim(
+            account,
+            equestrian_id=uuid4(),
+            lifecycle=BindingLifecycle(1, 0, 0, account, "123"),
+            locked_by="worker",
+            lease_seconds=60,
+        )
     assert raised.value is failure
 
 

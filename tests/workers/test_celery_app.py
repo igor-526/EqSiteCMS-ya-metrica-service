@@ -15,15 +15,25 @@ def test_app_configuration_and_discovery():
         conf = app.conf
         assert app.main == "ya-metrica-service"
         assert conf.task_default_queue == "ya_metrica"
-        assert [q.name for q in conf.task_queues] == ["ya_metrica"]
+        assert [q.name for q in conf.task_queues] == ["ya_metrica", "ya_metrica_cleanup", "ya_metrica_merge"]
         assert conf.task_serializer == conf.result_serializer == "json"
         assert conf.accept_content == ["json"]
         assert conf.task_acks_late and conf.task_reject_on_worker_lost and conf.task_ignore_result
         assert conf.task_expires == 3600
         assert conf.worker_prefetch_multiplier == 1
         assert conf.broker_transport_options == {"visibility_timeout": 3600}
-        assert conf.beat_schedule == {"metrica-dispatch-ready": {"task": "metrica.dispatch_ready", "schedule": 17}}
+        assert conf.beat_schedule == {
+            "metrica-dispatch-ready": {"task": "metrica.dispatch_ready", "schedule": 17},
+            "metrica-dispatch-maintenance": {"task": "metrica.dispatch_maintenance", "schedule": 17},
+            "metrica-replay-intents": {"task": "metrica.replay_intents", "schedule": 17},
+        }
+        assert conf.task_routes == {
+            "metrica.cleanup_tick": {"queue": "ya_metrica_cleanup"},
+            "metrica.merge_tick": {"queue": "ya_metrica_merge"},
+        }
         app.loader.import_default_modules()
+        for name in ["cleanup_tick", "merge_tick", "dispatch_maintenance", "replay_intents"]:
+            assert f"metrica.{name}" in app.tasks
         for name in ["metrica.process_account", "metrica.dispatch_ready"]:
             assert name in app.tasks
             assert app.tasks[name].max_retries == 3

@@ -13,12 +13,20 @@ from api import page_stats_router, yandex_metrica, yandex_metrica_router
 from api.search_query_stats import router as search_query_stats_router
 from clients.nats.client import NatsJetstreamClient
 from clients.nats.consumers.parse_run import ParseRunConsumer
+from clients.nats.maintenance_result_publisher import MaintenanceResultPublisher
 from containers import services_container
-from containers.application import nats_client_provider, parse_run_consumer_provider
+from containers.application import (
+    create_maintenance_consumers,
+    maintenance_nats_client_provider,
+    nats_client_provider,
+    parse_run_consumer_provider,
+    settings_container,
+)
 from core.exceptions import AppError
 from settings import settings
 from utils.configure_sentry import configure_sentry
 from utils.database import close_database
+from workers.maintenance_runtime import relay_results, supervise_maintenance
 
 configure_sentry()
 
@@ -54,9 +62,26 @@ async def lifespan(_: FastAPI):
     task = asyncio.create_task(
         supervise_nats(nats_client_provider(), parse_run_consumer_provider()), name="metrica-nats-supervisor"
     )
+    maintenance_task = None
+    if settings.maintenance_runtime_enabled:
+        client = maintenance_nats_client_provider()
+        nats_settings = settings_container.nats_settings()
+        consumers = create_maintenance_consumers(client, nats_settings)
+        publisher = MaintenanceResultPublisher(client=client, settings=nats_settings)
+        maintenance_task = asyncio.create_task(
+            supervise_maintenance(
+                client,
+                consumers,
+                lambda: relay_results(publisher, interval=settings.maintenance_relay_interval_seconds),
+            ),
+            name="metrica-maintenance-supervisor",
+        )
     try:
         yield
     finally:
+        if maintenance_task is not None:
+            maintenance_task.cancel()
+            await asyncio.gather(maintenance_task, return_exceptions=True)
         task.cancel()
         try:
             await task

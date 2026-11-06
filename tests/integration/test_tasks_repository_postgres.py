@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.entities import DateMode, ParseErrorCode, ParseKind, ParseRun, ParseTask, StatRow, TaskStatus
+from core.entities.metrica_maintenance import BindingLifecycle
 from core.protocols.repositories import LeaseLostError
 from models import metrica_page_stats, metrica_parse_runs, metrica_parse_tasks
 from repositories import ParseRunRepository, ParseTaskRepository, StatsRepository
@@ -18,7 +19,7 @@ DAY = date(2026, 10, 23)
 
 
 def run_tasks(*, eq=None, account=None, count=2, max_attempts=3):
-    run = ParseRun(equestrian_id=eq or uuid4(), date_mode=DateMode.EXPLICIT)
+    run = ParseRun(equestrian_id=eq or uuid4(), date_mode=DateMode.EXPLICIT, binding_generation=1)
     account = account or uuid4()
     tasks = [
         ParseTask(
@@ -26,6 +27,7 @@ def run_tasks(*, eq=None, account=None, count=2, max_attempts=3):
             equestrian_id=run.equestrian_id,
             yandex_account_id=account,
             counter_id="123",
+            binding_generation=run.binding_generation,
             kind=ParseKind.PAGES,
             date_from=DAY,
             date_to=DAY,
@@ -51,6 +53,72 @@ async def task_row(session, task_id):
     )
 
 
+async def claim(repo, account, **kwargs) -> ParseTask | None:
+    # Test fixture peer snapshot; production obtains this via authenticated HTTP.
+    tenants = await repo.list_queued_tenants(account)
+    for tenant in tenants:
+        row = (
+            (
+                await repo.session.execute(
+                    select(metrica_parse_tasks)
+                    .where(
+                        metrica_parse_tasks.c.equestrian_id == tenant,
+                        metrica_parse_tasks.c.yandex_account_id == account,
+                    )
+                    .limit(1)
+                )
+            )
+            .mappings()
+            .one()
+        )
+        task = await repo.claim(
+            account,
+            equestrian_id=tenant,
+            lifecycle=BindingLifecycle(
+                row["binding_generation"],
+                row["observed_cleanup_requested_seq"],
+                row["observed_cleanup_requested_seq"],
+                account,
+                row["counter_id"],
+            ),
+            **kwargs,
+        )
+        if task is not None:
+            return task
+    return None
+
+
+async def dispatchable(repo):
+    result = set()
+    for tenant in await repo.list_queued_tenants():
+        row = (
+            (
+                await repo.session.execute(
+                    select(metrica_parse_tasks)
+                    .where(
+                        metrica_parse_tasks.c.equestrian_id == tenant,
+                    )
+                    .limit(1)
+                )
+            )
+            .mappings()
+            .one()
+        )
+        result.update(
+            await repo.list_dispatchable_accounts(
+                equestrian_id=tenant,
+                lifecycle=BindingLifecycle(
+                    row["binding_generation"],
+                    row["observed_cleanup_requested_seq"],
+                    row["observed_cleanup_requested_seq"],
+                    row["yandex_account_id"],
+                    row["counter_id"],
+                ),
+            )
+        )
+    return sorted(result)
+
+
 async def test_it_ms_08_order_and_dispatch(pg_session):
     account = uuid4()
     older, tasks = await enqueue(pg_session, account=account, count=3)
@@ -62,19 +130,23 @@ async def test_it_ms_08_order_and_dispatch(pg_session):
         .where(metrica_parse_tasks.c.id == tasks[0].id)
         .values(next_attempt_at=datetime.now(UTC) + timedelta(hours=1))
     )
-    assert set(await repo.list_dispatchable_accounts()) == {account, foreign[0].yandex_account_id}
-    task = await repo.claim(account, locked_by="worker", lease_seconds=60)
+    assert set(await dispatchable(repo)) == {account, foreign[0].yandex_account_id}
+    task = await claim(repo, account, locked_by="worker", lease_seconds=60)
+    assert task is not None
     assert task is not None and task.id == tasks[1].id and task.run_id == older.id
     assert task.status == TaskStatus.RUNNING and task.attempts == 0 and task.started_at is not None
+    assert task.locked_until is not None
     assert task.locked_until > datetime.now(UTC)
-    assert await repo.claim(account, locked_by="duplicate", lease_seconds=60) is None
-    assert await repo.list_dispatchable_accounts() == [foreign[0].yandex_account_id]
+    assert await claim(repo, account, locked_by="duplicate", lease_seconds=60) is None
+    assert await dispatchable(repo) == [foreign[0].yandex_account_id]
     await repo.mark_succeeded(task.id, locked_by="worker", rows_deleted=2)
     assert (await task_row(pg_session, task.id))["rows_deleted"] == 2
-    next_task = await repo.claim(account, locked_by="worker", lease_seconds=60)
+    next_task = await claim(repo, account, locked_by="worker", lease_seconds=60)
+    assert next_task is not None
     assert next_task.id == tasks[2].id
     await repo.mark_succeeded(next_task.id, locked_by="worker")
-    next_task = await repo.claim(account, locked_by="worker", lease_seconds=60)
+    next_task = await claim(repo, account, locked_by="worker", lease_seconds=60)
+    assert next_task is not None
     assert next_task.id == newer[0].id
 
 
@@ -92,7 +164,8 @@ async def test_it_ms_09_parallel_claim(pg_engine, same_account):
 
     async def first_claim():
         async with AsyncSession(pg_engine) as session:
-            result = await ParseTaskRepository(session).claim(account, locked_by="first", lease_seconds=60)
+            result = await claim(ParseTaskRepository(session), account, locked_by="first", lease_seconds=60)
+            assert result is not None
             claimed.set()
             await second_started.wait()
             # Let second claim observe uncommitted row locks and race the unique index.
@@ -104,7 +177,7 @@ async def test_it_ms_09_parallel_claim(pg_engine, same_account):
         await claimed.wait()
         async with AsyncSession(pg_engine) as session:
             second_started.set()
-            result = await ParseTaskRepository(session).claim(other, locked_by="second", lease_seconds=60)
+            result = await claim(ParseTaskRepository(session), other, locked_by="second", lease_seconds=60)
             # A unique-index loser must leave the outer transaction usable.
             assert await session.scalar(select(func.count()).select_from(metrica_parse_runs))
             await session.commit()
@@ -121,20 +194,21 @@ async def test_it_ms_09_parallel_claim(pg_engine, same_account):
 async def test_it_ms_10_running_unique(pg_session):
     _, tasks = await enqueue(pg_session)
     repo = ParseTaskRepository(pg_session)
-    await repo.claim(tasks[0].yandex_account_id, locked_by="worker", lease_seconds=60)
+    await claim(repo, tasks[0].yandex_account_id, locked_by="worker", lease_seconds=60)
     with pytest.raises(IntegrityError) as exc:
         async with pg_session.begin_nested():
             await pg_session.execute(
                 update(metrica_parse_tasks).where(metrica_parse_tasks.c.id == tasks[1].id).values(status="running")
             )
-    assert exc.value.orig.sqlstate == "23505"
+    assert getattr(exc.value.orig, "sqlstate", None) == "23505"
 
 
 @pytest.mark.parametrize("max_attempts,expected", [(3, "queued"), (1, "failed")])
 async def test_it_ms_11_reaper(pg_session, max_attempts, expected):
     _, tasks = await enqueue(pg_session, max_attempts=max_attempts)
     repo = ParseTaskRepository(pg_session)
-    task = await repo.claim(tasks[0].yandex_account_id, locked_by="old", lease_seconds=60)
+    task = await claim(repo, tasks[0].yandex_account_id, locked_by="old", lease_seconds=60)
+    assert task is not None
     await repo.save_checkpoint(task.id, locked_by="old", next_offset=101, lease_seconds=120, rows_fetched=100)
     await pg_session.execute(
         update(metrica_parse_tasks)
@@ -157,7 +231,8 @@ async def test_it_ms_12_page_checkpoint_atomicity(pg_engine):
     async with AsyncSession(pg_engine) as session:
         run, tasks = await enqueue(session)
         repo = ParseTaskRepository(session)
-        task = await repo.claim(tasks[0].yandex_account_id, locked_by="worker", lease_seconds=60)
+        task = await claim(repo, tasks[0].yandex_account_id, locked_by="worker", lease_seconds=60)
+        assert task is not None
         await session.commit()
         row = StatRow(
             equestrian_id=run.equestrian_id,
@@ -245,7 +320,8 @@ async def test_it_ms_14_fail_fast(pg_session):
     _, tasks = await enqueue(pg_session, count=7)
     _, foreign = await enqueue(pg_session)
     repo = ParseTaskRepository(pg_session)
-    task = await repo.claim(tasks[0].yandex_account_id, locked_by="worker", lease_seconds=60)
+    task = await claim(repo, tasks[0].yandex_account_id, locked_by="worker", lease_seconds=60)
+    assert task is not None
     await repo.mark_failed(
         task.id, locked_by="worker", error_code=ParseErrorCode.CREDENTIALS_INVALID, error_status=401
     )
@@ -261,7 +337,8 @@ async def test_it_ms_14_fail_fast(pg_session):
 async def test_retry_checkpoint_and_lease_fencing(pg_session):
     _, tasks = await enqueue(pg_session, max_attempts=2)
     repo = ParseTaskRepository(pg_session)
-    task = await repo.claim(tasks[0].yandex_account_id, locked_by="one", lease_seconds=60)
+    task = await claim(repo, tasks[0].yandex_account_id, locked_by="one", lease_seconds=60)
+    assert task is not None
     with pytest.raises(LeaseLostError):
         await repo.save_checkpoint(task.id, locked_by="stale", next_offset=11, lease_seconds=60)
     await repo.renew_lease(task.id, locked_by="one", lease_seconds=120)
@@ -277,7 +354,8 @@ async def test_retry_checkpoint_and_lease_fencing(pg_session):
     )
     row = await task_row(pg_session, task.id)
     assert row["attempts"] == 1 and row["status"] == "queued" and row["next_offset"] == 11
-    resumed = await repo.claim(task.yandex_account_id, locked_by="two", lease_seconds=60)
+    resumed = await claim(repo, task.yandex_account_id, locked_by="two", lease_seconds=60)
+    assert resumed is not None
     assert resumed.id == task.id and resumed.next_offset == 11 and resumed.started_at == task.started_at
     with pytest.raises(LeaseLostError):
         await repo.mark_succeeded(task.id, locked_by="one")
@@ -322,9 +400,21 @@ async def test_it_mp_01_migration_preserves_legacy_rows(pg_schema_engine):
         await connection.run_sync(lambda conn: migrate(conn, "20261026_0002"))
         # Use the frozen revision, whose run table deliberately has no job_id.
         frozen = script.get_revision("20261026_0002").module
-        await connection.execute(frozen.metrica_parse_runs.insert().values(legacy.model_dump(exclude={"job_id"})))
+        await connection.execute(
+            frozen.metrica_parse_runs.insert().values(
+                {key: value for key, value in legacy.model_dump().items() if key in frozen.metrica_parse_runs.c}
+            )
+        )
         for task in tasks:
-            await connection.execute(frozen.metrica_parse_tasks.insert().values(task.model_dump(exclude_none=True)))
+            await connection.execute(
+                frozen.metrica_parse_tasks.insert().values(
+                    {
+                        key: value
+                        for key, value in task.model_dump(exclude_none=True).items()
+                        if key in frozen.metrica_parse_tasks.c
+                    }
+                )
+            )
         await connection.execute(
             frozen.metrica_page_stats.insert().values(
                 id=uuid4(),
@@ -342,11 +432,14 @@ async def test_it_mp_01_migration_preserves_legacy_rows(pg_schema_engine):
         task_rows = (await connection.execute(select(frozen.metrica_parse_tasks))).mappings().all()
         stat_rows = (await connection.execute(select(metrica_page_stats))).mappings().all()
         await connection.run_sync(lambda conn: migrate(conn, "head"))
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "20261028_0003"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == script.get_current_head()
         runs = (await connection.execute(select(metrica_parse_runs))).mappings().all()
         assert len(runs) == 1 and runs[0]["job_id"] is None
         assert ParseRun.model_validate(runs[0]).id == legacy.id
-        assert (await connection.execute(select(metrica_parse_tasks))).mappings().all() == task_rows
+        upgraded = (await connection.execute(select(metrica_parse_tasks))).mappings().all()
+        assert [{key: row[key] for key in task_rows[0]} for row in upgraded] == task_rows
+        assert all(row["binding_generation"] == row["observed_cleanup_requested_seq"] == 0 for row in upgraded)
+        assert all(row["fencing_revision"] == 0 for row in upgraded)
         assert (await connection.execute(select(metrica_page_stats))).mappings().all() == stat_rows
         assert (
             await connection.run_sync(lambda conn: compare_metadata(MigrationContext.configure(conn), metadata)) == []
@@ -354,14 +447,16 @@ async def test_it_mp_01_migration_preserves_legacy_rows(pg_schema_engine):
         for _ in range(2):
             extra, _ = run_tasks()
             await connection.execute(metrica_parse_runs.insert().values(extra.model_dump()))
-        await connection.run_sync(lambda conn: migrate(conn, "20261026_0002", downgrade=True))
-        columns = await connection.run_sync(lambda conn: inspect(conn).get_columns("metrica_parse_runs"))
-        assert "job_id" not in {column["name"] for column in columns}
-        assert await connection.scalar(select(func.count()).select_from(frozen.metrica_parse_runs)) == 3
-        assert (await connection.execute(select(metrica_parse_tasks))).mappings().all() == task_rows
-        assert (await connection.execute(select(metrica_page_stats))).mappings().all() == stat_rows
-        await connection.run_sync(lambda conn: migrate(conn, "head"))
+        # The retained-ledger head must never be downgraded destructively.
+        with pytest.raises(RuntimeError, match="ledgers must be retained"):
+            await connection.run_sync(lambda conn: migrate(conn, "20261026_0002", downgrade=True))
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == script.get_current_head()
+        assert "metrica_maintenance_operations" in await connection.run_sync(
+            lambda conn: inspect(conn).get_table_names()
+        )
         assert await connection.scalar(select(func.count()).select_from(metrica_parse_runs)) == 3
+        assert (await connection.execute(select(metrica_parse_tasks))).mappings().all() == upgraded
+        assert (await connection.execute(select(metrica_page_stats))).mappings().all() == stat_rows
 
 
 @pytest.mark.infrastructure
@@ -429,3 +524,83 @@ async def test_it_mp_01_concurrent_job_conflict(pg_engine, same_equestrian):
     async with AsyncSession(pg_engine) as session:
         assert await session.scalar(select(func.count()).select_from(metrica_parse_runs)) == 1
         assert await session.scalar(select(func.count()).select_from(metrica_parse_tasks)) == 2
+
+
+async def test_ut_d_05_authoritative_delete_cancels_queued_retry_preserves_audit(pg_session):
+    run, tasks = await enqueue(pg_session, count=3)
+    repo = ParseTaskRepository(pg_session)
+    lifecycle = BindingLifecycle(run.binding_generation, 0, 0, tasks[0].yandex_account_id, "123")
+    running = await repo.claim(
+        tasks[0].yandex_account_id,
+        equestrian_id=run.equestrian_id,
+        lifecycle=lifecycle,
+        locked_by="running",
+        lease_seconds=60,
+    )
+    assert running is not None
+    await pg_session.execute(
+        update(metrica_parse_tasks)
+        .where(metrica_parse_tasks.c.id == tasks[1].id)
+        .values(
+            next_attempt_at=datetime.now(UTC) + timedelta(days=1),
+            attempts=2,
+            next_offset=101,
+            rows_fetched=100,
+        )
+    )
+    # Authoritative barrier arrives before local NATS cleanup operation.
+    assert (
+        await repo.list_dispatchable_accounts(equestrian_id=run.equestrian_id, lifecycle=BindingLifecycle(1, 1, 0))
+        == []  # noqa: W503
+    )
+    assert (await task_row(pg_session, running.id))["status"] == "running"
+    row = await task_row(pg_session, tasks[1].id)
+    assert row["status"] == "cancelled" and row["finished_at"] is not None
+    assert row["attempts"] == 2 and row["next_offset"] == 101 and row["rows_fetched"] == 100
+    assert await pg_session.scalar(select(metrica_parse_runs.c.id).where(metrica_parse_runs.c.id == run.id)) == run.id
+
+
+async def test_ut_d_04_stale_snapshot_cannot_bypass_local_gate(pg_session):
+    run, tasks = await enqueue(pg_session)
+    repo = ParseTaskRepository(pg_session)
+    stale = BindingLifecycle(0, 0, 0, tasks[0].yandex_account_id, "123")
+    await repo.list_dispatchable_accounts(equestrian_id=run.equestrian_id, lifecycle=BindingLifecycle(1, 1, 0))
+    assert (
+        await repo.claim(
+            tasks[0].yandex_account_id,
+            equestrian_id=run.equestrian_id,
+            lifecycle=stale,
+            locked_by="late",
+            lease_seconds=60,
+        )
+        is None
+    )
+    rows = [await task_row(pg_session, task.id) for task in tasks]
+    assert all(row["status"] == "cancelled" for row in rows)
+
+
+async def test_ut_d_06_merge_pauses_queued_without_cancel_and_other_tenant_claims(pg_session):
+    from core.entities.metrica_maintenance import WorkKind
+    from repositories.metrica_maintenance_storage_repository import MaintenanceStorageRepository
+
+    run, tasks = await enqueue(pg_session)
+    await MaintenanceStorageRepository(pg_session).save_operation(
+        run.equestrian_id,
+        uuid4(),
+        kind=WorkKind.MERGE,
+        normalization_revision=1,
+    )
+    repo = ParseTaskRepository(pg_session)
+    assert (
+        await repo.claim(
+            tasks[0].yandex_account_id,
+            equestrian_id=run.equestrian_id,
+            lifecycle=BindingLifecycle(0, 0, 0, tasks[0].yandex_account_id, "123"),
+            locked_by="merge-paused",
+            lease_seconds=60,
+        )
+        is None
+    )
+    assert (await task_row(pg_session, tasks[0].id))["status"] == "queued"
+    _, foreign = await enqueue(pg_session)
+    assert await claim(repo, foreign[0].yandex_account_id, locked_by="other", lease_seconds=60) is not None

@@ -1,30 +1,24 @@
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import exists, insert, select, text
+from sqlalchemy import exists, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.entities import ParseRun, ParseTask, TaskStatus
 from core.exceptions.parse import ParseJobAlreadyExistsError
 from models import metrica_parse_runs, metrica_parse_tasks
+from repositories.metrica_maintenance_repository import MaintenanceArbitrationRepository
 
 
-class ParseRunRepository:
+class ParseRunRepository(MaintenanceArbitrationRepository):
     """Advisory lock lasts until caller commit, including auto-date resolution.
 
     Call has_active_tasks before reading auto dates; create_run_with_tasks repeats
     the check under the same reentrant lock and returns False for an active run.
     """
 
-    def __init__(self, session: AsyncSession) -> None:
-        self.session = session
-
     async def lock_equestrian(self, equestrian_id: UUID) -> None:
-        await self.session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-            {"key": f"metrica-parse:{equestrian_id}"},
-        )
+        await self.lock_scope([equestrian_id])
 
     async def has_active_tasks(self, equestrian_id: UUID) -> bool:
         await self.lock_equestrian(equestrian_id)

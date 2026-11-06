@@ -1,6 +1,8 @@
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from core.entities.metrica_maintenance import BindingLifecycle
 
 
 class BindingAccount(BaseModel):
@@ -19,6 +21,26 @@ class MetricaCounterBinding(BaseModel):
 
 class MetricaBinding(BaseModel):
     counter: MetricaCounterBinding | None
+    binding_generation: int = Field(ge=0, strict=True)
+    cleanup_requested_seq: int = Field(ge=0, strict=True)
+    cleanup_completed_seq: int = Field(ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> MetricaBinding:
+        if self.cleanup_completed_seq > self.cleanup_requested_seq:
+            raise ValueError("Invalid cleanup watermark")
+        if self.counter is not None and self.binding_generation == 0:
+            raise ValueError("Existing binding requires a generation")
+        return self
+
+    def lifecycle(self) -> BindingLifecycle:
+        return BindingLifecycle(
+            binding_generation=self.binding_generation,
+            cleanup_requested_seq=self.cleanup_requested_seq,
+            cleanup_completed_seq=self.cleanup_completed_seq,
+            account_id=self.counter.yandex_account_id if self.counter else None,
+            counter_id=self.counter.counter_id if self.counter else None,
+        )
 
 
 class EncAccessToken(BaseModel):

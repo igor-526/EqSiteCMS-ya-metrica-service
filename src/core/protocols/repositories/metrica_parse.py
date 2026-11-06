@@ -6,6 +6,7 @@ from typing import Protocol
 from uuid import UUID
 
 from core.entities import ParseErrorCode, ParseRun, ParseTask
+from core.entities.metrica_maintenance import BindingLifecycle
 
 
 class LeaseLostError(RuntimeError):
@@ -25,9 +26,29 @@ class ParseRunRepositoryProtocol(Protocol):
 
 
 class ParseTaskRepositoryProtocol(Protocol):
-    async def claim(self, account_id: UUID, *, locked_by: str, lease_seconds: int) -> ParseTask | None: ...
+    async def list_queued_tenants(self, account_id: UUID | None = None) -> list[UUID]: ...
 
-    async def list_dispatchable_accounts(self) -> list[UUID]: ...
+    async def cancel_queued_before_cleanup(self, equestrian_id: UUID, *, cleanup_seq: int) -> int: ...
+
+    async def claim(
+        self,
+        account_id: UUID,
+        *,
+        equestrian_id: UUID,
+        lifecycle: BindingLifecycle,
+        locked_by: str,
+        lease_seconds: int,
+    ) -> ParseTask | None: ...
+
+    async def list_dispatchable_accounts(self, *, equestrian_id: UUID, lifecycle: BindingLifecycle) -> list[UUID]: ...
+
+    async def assert_writable(self, task_id: UUID, *, locked_by: str) -> None:
+        """Lock tenant/account/task until commit; allow only the current live attempt.
+
+        Pending maintenance permits draining. Executing maintenance or lease loss
+        raises LeaseLostError and requires rollback of all page/reconcile effects.
+        """
+        ...
 
     async def renew_lease(self, task_id: UUID, *, locked_by: str, lease_seconds: int) -> None: ...
 
@@ -56,6 +77,7 @@ class ParseTaskRepositoryProtocol(Protocol):
         next_attempt_at: datetime,
         error_code: ParseErrorCode,
         error_status: int | None = None,
+        lifecycle: BindingLifecycle | None = None,
     ) -> None: ...
 
     async def mark_failed(
@@ -67,7 +89,11 @@ class ParseTaskRepositoryProtocol(Protocol):
         error_status: int | None = None,
     ) -> None: ...
 
-    async def reap_expired_leases(self) -> int: ...
+    async def list_recovery_tenants(self, *, limit: int = 100) -> list[UUID]: ...
+
+    async def reap_expired_leases(
+        self, *, equestrian_id: UUID | None = None, lifecycle: BindingLifecycle | None = None
+    ) -> int: ...
 
     async def fail_queued_by_account(
         self,

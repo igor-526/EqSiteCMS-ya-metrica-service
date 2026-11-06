@@ -2,6 +2,7 @@ import base64
 import hashlib
 from datetime import date
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from cryptography.fernet import Fernet
 
 from core.entities.metrica_parse import ParseKind, ParseTask
 from core.exceptions.peer import PeerServiceException
+from core.protocols.clients.yandex_service import YandexServiceClientProtocol
 from core.schemas.clients.yandex_service import EncAccessToken, MetricaBinding
 from core.services.encryption_service import EncryptionService
 from core.services.parse_job_factory import ParseJobFactory
@@ -28,24 +30,31 @@ def env():
         date_to=date(2026, 10, 25),
         sequence=1,
         max_attempts=3,
+        binding_generation=3,
+        observed_cleanup_requested_seq=2,
     )
     # Independent producer, matching the yandex-service SHA256 + Fernet wire format.
     cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(b"shared-key").digest()))
     ciphertext = cipher.encrypt(b"TOKEN_SECRET").decode()
     binding = MetricaBinding.model_validate(
         {
+            "binding_generation": 3,
+            "cleanup_requested_seq": 2,
+            "cleanup_completed_seq": 2,
             "counter": {
                 "counter_id": task.counter_id,
                 "equestrian_id": task.equestrian_id,
                 "yandex_account": {"id": task.yandex_account_id},
-            }
+            },
         }
     )
     client = SimpleNamespace(
         get_metrica_binding=AsyncMock(return_value=binding),
         get_enc_access_token=AsyncMock(return_value=EncAccessToken(enc_access_token=ciphertext)),
     )
-    factory = ParseJobFactory(yandex_client=client, encryption=EncryptionService("shared-key"))
+    factory = ParseJobFactory(
+        yandex_client=cast(YandexServiceClientProtocol, client), encryption=EncryptionService("shared-key")
+    )
     return SimpleNamespace(**locals())
 
 
@@ -100,3 +109,18 @@ async def test_peer_unavailable(env, method):
     decision = RetryPolicy().classify(exc.value)
     assert decision.error_code == "yandex_service_unavailable"
     assert decision.retryable
+
+
+@pytest.mark.parametrize("generation,completed", [(0, 2), (2, 2), (4, 2), (3, 3)])
+async def test_generation_and_completed_cleanup_guard_before_credentials(env, generation, completed):
+    env.task.binding_generation = generation
+    env.binding.cleanup_requested_seq = max(2, completed)
+    env.binding.cleanup_completed_seq = completed
+    with pytest.raises(ParseExecutionError, match="binding_changed"):
+        await env.factory.create(task=env.task)
+    env.client.get_enc_access_token.assert_not_awaited()
+
+
+async def test_pending_cleanup_does_not_interrupt_same_generation_live_attempt(env):
+    env.binding.cleanup_requested_seq = 3
+    assert (await env.factory.create(task=env.task)).task is env.task

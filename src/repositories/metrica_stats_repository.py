@@ -8,10 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import ReturningInsert
 
 from core.entities import ParseKind, StatRow
+from core.entities.metrica_metrics import BASE_METRICS
 from core.protocols.repositories.metrica_stats import UpsertCounts
 from models import metrica_page_stats, metrica_search_query_stats
-
-METRICS = ("visits", "users", "pageviews", "bounces", "visit_duration_seconds")
 
 
 class StatsRepository:
@@ -50,7 +49,7 @@ class StatsRepository:
                     "stat_date": row.stat_date,
                     self.entity_column: row.entity_id,
                     "parse_task_id": row.parse_task_id,
-                    **{name: getattr(row, name) for name in METRICS},
+                    **{name: getattr(row, name) for name in BASE_METRICS},
                 }
             )
         stmt = insert(self.table).values(values)
@@ -60,7 +59,7 @@ class StatsRepository:
             set_={
                 **{
                     name: case((same_task, self.table.c[name] + stmt.excluded[name]), else_=stmt.excluded[name])
-                    for name in METRICS
+                    for name in BASE_METRICS
                 },
                 "parse_task_id": stmt.excluded.parse_task_id,
                 "updated_at": func.now(),

@@ -8,6 +8,7 @@ from uuid import UUID
 from core.entities.metrica_parse import ParseErrorCode, ParseKind
 from core.protocols.repositories.metrica_parse import LeaseLostError, ParseTaskRepositoryProtocol
 from core.protocols.repositories.metrica_stats import StatsRepositoryProtocol
+from core.services.parse_dispatch_service import ParseDispatchService
 from core.services.parse_enqueue_service import ParseTransactionProtocol
 from core.services.parse_job_factory import ParseJobFactory
 from core.services.parse_retry_policy import ParseExecutionError, RetryPolicy
@@ -28,6 +29,7 @@ class TaskRunner:
         self,
         *,
         task_repository: ParseTaskRepositoryProtocol,
+        dispatch_service: ParseDispatchService,
         pages_repository: StatsRepositoryProtocol,
         search_queries_repository: StatsRepositoryProtocol,
         transaction: ParseTransactionProtocol,
@@ -39,6 +41,7 @@ class TaskRunner:
     ) -> None:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
+        self._dispatch = dispatch_service
         self._tasks = task_repository
         self._stats = {ParseKind.PAGES: pages_repository, ParseKind.SEARCH_QUERIES: search_queries_repository}
         self._transaction = transaction
@@ -49,8 +52,9 @@ class TaskRunner:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def run_next_for_account(self, account_id: UUID, *, locked_by: str) -> RunOutcome:
-        async with self._transaction.begin():
-            task = await self._tasks.claim(account_id, locked_by=locked_by, lease_seconds=self._lease_seconds)
+        task = await self._dispatch.claim_next_for_account(
+            account_id, locked_by=locked_by, lease_seconds=self._lease_seconds
+        )
         if task is None:
             return RunOutcome()
         started = monotonic()
@@ -71,6 +75,7 @@ class TaskRunner:
             await self._ingestion.ingest(job=job, locked_by=locked_by)
             try:
                 async with self._transaction.begin():
+                    await self._tasks.assert_writable(task.id, locked_by=locked_by)
                     deleted = await self._stats[task.kind].reconcile_window(
                         equestrian_id=task.equestrian_id,
                         date_from=task.date_from,
@@ -89,21 +94,27 @@ class TaskRunner:
             return RunOutcome()
         except Exception as error:
             decision = self._retry.classify(error)
-            status = "queued" if decision.retryable and task.attempts + 1 < task.max_attempts else "failed"
+            status = "retry_resolved" if decision.retryable else "failed"
             logger.warning(
                 "Parse error: task_id=%s error_code=%s error_status=%s",
                 task.id,
                 decision.error_code,
                 decision.error_status,
             )
+            lifecycle = None
+            if status == "retry_resolved":
+                lifecycle = await self._dispatch.lifecycle_for_tenant(task.equestrian_id)
+                if lifecycle is None:
+                    return RunOutcome()  # expiry recovery will repeat authoritative lookup
             try:
                 async with self._transaction.begin():
-                    if status == "queued":
+                    if status == "retry_resolved":
                         delay = timedelta(seconds=self._retry.delay_seconds(task.attempts + 1))
                         next_attempt_at = self._clock() + delay
                         await self._tasks.schedule_retry(
                             task.id,
                             next_attempt_at=next_attempt_at,
+                            lifecycle=lifecycle,
                             locked_by=locked_by,
                             error_code=decision.error_code,
                             error_status=decision.error_status,
@@ -136,5 +147,5 @@ class TaskRunner:
             monotonic() - started,
         )
         async with self._transaction.begin():
-            ready = await self._tasks.list_dispatchable_accounts()
-        return RunOutcome(has_more=account_id in ready)
+            tenants = await self._tasks.list_queued_tenants(account_id)
+        return RunOutcome(has_more=bool(tenants))

@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -50,18 +50,19 @@ def env():
 
         return AsyncMock(side_effect=call)
 
-    tasks = SimpleNamespace(
+    tasks = Mock(
         claim=action("claim", task),
+        assert_writable=action("guard"),
         mark_succeeded=action("succeeded"),
         mark_failed=action("failed"),
         schedule_retry=action("retry"),
         fail_queued_by_account=action("fail-account", 6),
-        list_dispatchable_accounts=action("ready", [task.yandex_account_id]),
+        list_queued_tenants=action("ready", [task.equestrian_id]),
     )
-    pages = SimpleNamespace(reconcile_window=action("reconcile", 2))
-    search = SimpleNamespace(reconcile_window=action("search-reconcile", 3))
+    pages = Mock(reconcile_window=action("reconcile", 2))
+    search = Mock(reconcile_window=action("search-reconcile", 3))
     job = ParseJob(task=task, access_token="TOKEN_SECRET")
-    factory = SimpleNamespace(create=action("job", job))
+    factory = Mock(create=action("job", job))
 
     async def ingest(**kwargs):
         events.append("ingest")
@@ -71,12 +72,19 @@ def env():
         task.rows_updated += 5
         task.rows_skipped += 5
 
-    ingestion = SimpleNamespace(ingest=AsyncMock(side_effect=ingest))
+    ingestion = Mock(ingest=AsyncMock(side_effect=ingest))
+
+    async def claim_next(*args, **kwargs):
+        async with begin():
+            return await tasks.claim(*args, **kwargs)
+
+    dispatch = Mock(claim_next_for_account=claim_next, lifecycle_for_tenant=AsyncMock(return_value=object()))
     runner = TaskRunner(
         task_repository=tasks,
+        dispatch_service=dispatch,
         pages_repository=pages,
         search_queries_repository=search,
-        transaction=SimpleNamespace(begin=begin),
+        transaction=Mock(begin=begin),
         job_factory=factory,
         ingestion=ingestion,
         retry_policy=RetryPolicy(),
@@ -101,6 +109,7 @@ async def test_success_commits_claim_before_job_and_reconciles_atomically(env, c
         "job",
         "ingest",
         "begin",
+        "guard",
         "reconcile",
         "succeeded",
         "commit",
@@ -134,7 +143,7 @@ async def test_no_claim_quiet_exit(env):
     env.tasks.claim.return_value = None
     assert not (await run(env)).has_more
     env.factory.create.assert_not_awaited()
-    env.tasks.list_dispatchable_accounts.assert_not_awaited()
+    env.tasks.list_queued_tenants.assert_not_awaited()
 
 
 @pytest.mark.parametrize("attempts,delay", [(0, 60), (1, 240)])
@@ -148,6 +157,7 @@ async def test_retry_attempt_count_backoff_and_no_reconciliation(env, attempts, 
         error_code=ParseErrorCode.PROVIDER_UNAVAILABLE,
         error_status=503,
         next_attempt_at=env.now + timedelta(seconds=delay),
+        lifecycle=env.dispatch.lifecycle_for_tenant.return_value,
     )
     env.pages.reconcile_window.assert_not_awaited()
     env.tasks.mark_failed.assert_not_awaited()
@@ -158,13 +168,11 @@ async def test_exhausted_attempt_fails(env):
     env.task.attempts = 2
     env.ingestion.ingest.side_effect = YandexClientException(429, category="http")
     await run(env)
-    env.tasks.mark_failed.assert_awaited_once_with(
-        env.task.id,
-        locked_by="worker",
-        error_code=ParseErrorCode.PROVIDER_RATE_LIMITED,
-        error_status=429,
-    )
-    env.tasks.schedule_retry.assert_not_awaited()
+    # Repository decides exhausted-vs-cancelled under the lifecycle/lease fence.
+    env.tasks.schedule_retry.assert_awaited_once()
+    assert env.tasks.schedule_retry.await_args.kwargs["error_code"] == ParseErrorCode.PROVIDER_RATE_LIMITED
+    assert env.tasks.schedule_retry.await_args.kwargs["error_status"] == 429
+    env.tasks.mark_failed.assert_not_awaited()
 
 
 @pytest.mark.parametrize("phase", ["factory", "ingest"])
@@ -224,7 +232,7 @@ async def test_stale_worker_never_transitions_or_dispatches(env, phase):
         getattr(env.tasks, "mark_failed" if phase == "failed" else "schedule_retry").side_effect = LeaseLostError()
     assert not (await run(env)).has_more
     env.tasks.fail_queued_by_account.assert_not_awaited()
-    env.tasks.list_dispatchable_accounts.assert_not_awaited()
+    env.tasks.list_queued_tenants.assert_not_awaited()
     if phase not in {"failed", "retry"}:
         env.tasks.mark_failed.assert_not_awaited()
         env.tasks.schedule_retry.assert_not_awaited()
@@ -243,13 +251,13 @@ async def test_unknown_failure_retry_without_secret_logging(env, caplog):
     env.ingestion.ingest.side_effect = RuntimeError("TOKEN_SECRET CIPHERTEXT_SECRET PHRASE_SECRET")
     with caplog.at_level(logging.INFO):
         await run(env)
-    assert "unexpected" in caplog.text and "status=queued" in caplog.text
+    assert "unexpected" in caplog.text and "status=retry_resolved" in caplog.text
     assert "SECRET" not in caplog.text
 
 
 async def test_no_more_ready_work(env):
-    env.tasks.list_dispatchable_accounts.side_effect = None
-    env.tasks.list_dispatchable_accounts.return_value = [uuid4()]
+    env.tasks.list_queued_tenants.side_effect = None
+    env.tasks.list_queued_tenants.return_value = []
     assert not (await run(env)).has_more
 
 
@@ -266,7 +274,7 @@ async def test_error_transition_storage_failure_propagates(env):
     env.tasks.schedule_retry.side_effect = RuntimeError()
     with pytest.raises(RuntimeError):
         await run(env)
-    env.tasks.list_dispatchable_accounts.assert_not_awaited()
+    env.tasks.list_queued_tenants.assert_not_awaited()
 
 
 async def test_error_logs_include_counts_from_already_committed_pages(env, caplog):
@@ -280,5 +288,24 @@ async def test_error_logs_include_counts_from_already_committed_pages(env, caplo
     env.ingestion.ingest.side_effect = ingest
     with caplog.at_level(logging.INFO):
         await run(env)
-    for marker in ["status=queued", "pages=1", "fetched=10", "inserted=8", "skipped=2", "deleted=0"]:
+    for marker in ["status=retry_resolved", "pages=1", "fetched=10", "inserted=8", "skipped=2", "deleted=0"]:
         assert marker in caplog.text
+
+
+async def test_ut_d_05_guard_loss_prevents_reconcile_and_terminal_transition(env):
+    env.tasks.assert_writable.side_effect = LeaseLostError()
+    assert not (await run(env)).has_more
+    assert env.events[-1] == "rollback"
+    env.pages.reconcile_window.assert_not_awaited()
+    env.tasks.mark_succeeded.assert_not_awaited()
+    env.tasks.schedule_retry.assert_not_awaited()
+    env.tasks.mark_failed.assert_not_awaited()
+    env.tasks.list_queued_tenants.assert_not_awaited()
+
+
+async def test_retry_lifecycle_outage_leaves_running_for_expiry_recovery(env):
+    env.ingestion.ingest.side_effect = TimeoutError()
+    env.dispatch.lifecycle_for_tenant.return_value = None
+    assert not (await run(env)).has_more
+    env.tasks.schedule_retry.assert_not_awaited()
+    env.tasks.mark_failed.assert_not_awaited()

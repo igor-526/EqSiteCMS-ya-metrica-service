@@ -12,6 +12,7 @@ class TaskStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ParseKind(StrEnum):
@@ -43,6 +44,8 @@ class ParseErrorCode(StrEnum):
 class ParseRun(Entity):
     job_id: UUID | None = None
     equestrian_id: UUID
+    binding_generation: int = Field(default=0, ge=0)
+    observed_cleanup_requested_seq: int = Field(default=0, ge=0)
     date_mode: DateMode
     clamped: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -51,6 +54,8 @@ class ParseRun(Entity):
 class ParseTask(Entity, TimestampMixin):
     run_id: UUID
     equestrian_id: UUID
+    binding_generation: int = Field(default=0, ge=0)
+    observed_cleanup_requested_seq: int = Field(default=0, ge=0)
     counter_id: str = Field(min_length=1, max_length=31)
     yandex_account_id: UUID
     kind: ParseKind
@@ -62,6 +67,7 @@ class ParseTask(Entity, TimestampMixin):
     max_attempts: int = Field(gt=0)
     next_attempt_at: datetime | None = None
     next_offset: int = Field(default=1, ge=1)
+    fencing_revision: int = Field(default=0, ge=0)
     locked_by: str | None = Field(default=None, max_length=128)
     locked_until: datetime | None = None
     started_at: datetime | None = None

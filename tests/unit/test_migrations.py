@@ -73,7 +73,7 @@ def test_revision_is_frozen_and_has_expected_head():
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(Config(str(ENV_PATH.parents[1] / "alembic.ini")))
-    assert script.get_current_head() == "20261028_0003"
+    assert script.get_current_head() == "20261102_0004"
     revision = script.get_revision("20261026_0002")
     assert revision.down_revision == "20260710_0001"
     tables = revision.module.revision_metadata.tables
@@ -142,7 +142,7 @@ def test_job_id_revision_upgrade_downgrade_and_model_match():
     from models import metrica_parse_runs
 
     script = ScriptDirectory.from_config(Config(str(ENV_PATH.parents[1] / "alembic.ini")))
-    revision = script.get_revision("head")
+    revision = script.get_revision("20261028_0003")
     assert revision.down_revision == "20261026_0002"
     output = StringIO()
     context = MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output})

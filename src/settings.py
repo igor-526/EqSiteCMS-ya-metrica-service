@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     task_max_attempts: int = Field(default=3, alias="TASK_MAX_ATTEMPTS", gt=0)
     task_retry_base_seconds: int = Field(default=60, alias="TASK_RETRY_BASE_SECONDS", gt=0)
     task_lease_seconds: int = Field(default=600, alias="TASK_LEASE_SECONDS", gt=0)
+    cleanup_batch_size: int = Field(default=1000, alias="CLEANUP_BATCH_SIZE", ge=1, le=10000)
+    maintenance_runtime_enabled: bool = Field(default=False, alias="MAINTENANCE_RUNTIME_ENABLED")
+    maintenance_dispatch_limit: int = Field(default=100, alias="MAINTENANCE_DISPATCH_LIMIT", ge=1, le=1000)
+    maintenance_relay_interval_seconds: int = Field(default=1, alias="MAINTENANCE_RELAY_INTERVAL_SECONDS", gt=0)
+    maintenance_lease_seconds: int = Field(default=60, alias="MAINTENANCE_LEASE_SECONDS", gt=0)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -103,6 +108,39 @@ class NatsSettings(BaseSettings):
         default="commands.parse.ya_metrica.run", alias="NATS_SUBJECT_PARSE_RUN", min_length=1
     )
     nats_consumer_parse_run: str = Field(default="ya-metrica-parse-run", alias="NATS_CONSUMER_PARSE_RUN", min_length=1)
+    nats_stream_yandex_lifecycle: str = Field(
+        default="YANDEX_LIFECYCLE", alias="NATS_STREAM_YANDEX_LIFECYCLE", min_length=1
+    )
+    nats_stream_seo_maintenance: str = Field(
+        default="SEO_MAINTENANCE", alias="NATS_STREAM_SEO_MAINTENANCE", min_length=1
+    )
+    nats_stream_maintenance_results: str = Field(
+        default="METRICA_MAINTENANCE_RESULTS", alias="NATS_STREAM_MAINTENANCE_RESULTS", min_length=1
+    )
+    nats_subject_cleanup_requested: str = Field(
+        default="events.yandex.metrica.cleanup.requested", alias="NATS_SUBJECT_CLEANUP_REQUESTED", min_length=1
+    )
+    nats_subject_pages_merge: str = Field(
+        default="commands.seo.pages.merge", alias="NATS_SUBJECT_PAGES_MERGE", min_length=1
+    )
+    nats_subject_pages_merge_finalized: str = Field(
+        default="events.seo.pages.merge.finalized", alias="NATS_SUBJECT_PAGES_MERGE_FINALIZED", min_length=1
+    )
+    nats_subject_cleanup_completed: str = Field(
+        default="events.metrica.cleanup.completed", alias="NATS_SUBJECT_CLEANUP_COMPLETED", min_length=1
+    )
+    nats_subject_pages_merge_completed: str = Field(
+        default="events.metrica.pages.merge.completed", alias="NATS_SUBJECT_PAGES_MERGE_COMPLETED", min_length=1
+    )
+    nats_consumer_cleanup_requested: str = Field(
+        default="ya-metrica-cleanup-requested", alias="NATS_CONSUMER_CLEANUP_REQUESTED", min_length=1
+    )
+    nats_consumer_pages_merge: str = Field(
+        default="ya-metrica-pages-merge", alias="NATS_CONSUMER_PAGES_MERGE", min_length=1
+    )
+    nats_consumer_pages_merge_finalized: str = Field(
+        default="ya-metrica-pages-merge-finalized", alias="NATS_CONSUMER_PAGES_MERGE_FINALIZED", min_length=1
+    )
     nats_consumer_ack_wait_seconds: float = Field(default=30, alias="NATS_CONSUMER_ACK_WAIT_SECONDS", gt=0)
     nats_consumer_max_deliver: int = Field(default=5, alias="NATS_CONSUMER_MAX_DELIVER", ge=1)
     nats_consumer_fetch_batch_size: int = Field(default=1, alias="NATS_CONSUMER_FETCH_BATCH_SIZE", ge=1)

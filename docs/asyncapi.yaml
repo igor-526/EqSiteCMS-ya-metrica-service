@@ -1,10 +1,10 @@
 asyncapi: 2.6.0
 info:
-  title: EqSiteCMS Ya Metrica Parse Commands
-  version: 1.0.0
+  title: EqSiteCMS Ya Metrica Parse and Maintenance
+  version: 1.1.0
   description: >-
-    Входящие команды seo-service. Доступ — доверенная внутренняя сеть без NATS auth;
-    production требует отдельно подтверждённой сетевой изоляции. Секреты не передаются.
+    Входящие команды seo-service. Доступ — доверенная внутренняя сеть без NATS auth; production требует
+    отдельно подтверждённой сетевой изоляции. Секреты не передаются.
 servers:
   jetstream:
     url: nats://eqsitecms-nats:4222
@@ -14,7 +14,8 @@ channels:
     x-jetstream-stream: PARSE_COMMANDS
     x-jetstream-stream-config:
       owner: seo-service
-      subjects: [commands.parse.>]
+      subjects:
+        - commands.parse.>
       storage: file
       retention: limits
       max-age-seconds: 604800
@@ -28,11 +29,123 @@ channels:
     subscribe:
       operationId: consumeMetricaParseRun
       description: >-
-        Success, duplicate job_id, active run, missing binding, invalid date range → ack.
-        Invalid envelope/provider/subject → term. Integration/storage failures → nak.
-        Consumer registers durable only; seo-service creates the stream.
+        Success, duplicate job_id, active run, missing binding, invalid date range → ack. Invalid
+        envelope/provider/subject → term. Integration/storage failures → nak. Consumer registers durable only;
+        seo-service creates the stream.
       message:
         $ref: '#/components/messages/ParseCommand'
+  events.yandex.metrica.cleanup.requested:
+    x-stream: YANDEX_LIFECYCLE
+    x-owner: yandex-service
+    x-consumers:
+      - service: ya-metrica-service
+        durable: ya-metrica-cleanup-requested
+        filter_subject: events.yandex.metrica.cleanup.requested
+        mode: pull
+        deliver_policy: all
+        ack_policy: explicit
+        ack_wait_seconds: 30
+        max_deliver: -1
+    subscribe:
+      operationId: subscribeCleanupRequested
+      description: >-
+        Body <=256 KiB, mappings <=500. Invalid schema/subject/header/tenant/hash/correlation → TERM.
+        Transient storage/commit failure → exponential NAK 1..60s, escalation after 5 deliveries, no retry
+        cap. ACK only after inbox+ledger commit; duplicate hash is compared. Seal may precede parts. No stats
+        work in NATS handler. Foreign owner startup lookup retries 10×2s linear; incompatible config fails
+        fast.
+      message:
+        $ref: '#/components/messages/CleanupRequested'
+  commands.seo.pages.merge:
+    x-stream: SEO_MAINTENANCE
+    x-owner: seo-service
+    x-consumers:
+      - service: ya-metrica-service
+        durable: ya-metrica-pages-merge
+        filter_subject: commands.seo.pages.merge
+        mode: pull
+        deliver_policy: all
+        ack_policy: explicit
+        ack_wait_seconds: 30
+        max_deliver: -1
+    subscribe:
+      operationId: subscribeMergeCommand
+      description: >-
+        Body <=256 KiB, mappings <=500. Invalid schema/subject/header/tenant/hash/correlation → TERM.
+        Transient storage/commit failure → exponential NAK 1..60s, escalation after 5 deliveries, no retry
+        cap. ACK only after inbox+ledger commit; duplicate hash is compared. Seal may precede parts. No stats
+        work in NATS handler. Foreign owner startup lookup retries 10×2s linear; incompatible config fails
+        fast.
+      message:
+        $ref: '#/components/messages/MergeCommand'
+  events.seo.pages.merge.finalized:
+    x-stream: SEO_MAINTENANCE
+    x-owner: seo-service
+    x-consumers:
+      - service: ya-metrica-service
+        durable: ya-metrica-pages-merge-finalized
+        filter_subject: events.seo.pages.merge.finalized
+        mode: pull
+        deliver_policy: all
+        ack_policy: explicit
+        ack_wait_seconds: 30
+        max_deliver: -1
+    subscribe:
+      operationId: subscribeMergeFinalized
+      description: >-
+        Body <=256 KiB, mappings <=500. Invalid schema/subject/header/tenant/hash/correlation → TERM.
+        Transient storage/commit failure → exponential NAK 1..60s, escalation after 5 deliveries, no retry
+        cap. ACK only after inbox+ledger commit; duplicate hash is compared. Seal may precede parts. No stats
+        work in NATS handler. Foreign owner startup lookup retries 10×2s linear; incompatible config fails
+        fast.
+      message:
+        $ref: '#/components/messages/MergeFinalized'
+  events.metrica.cleanup.completed:
+    x-stream: METRICA_MAINTENANCE_RESULTS
+    x-owner: ya-metrica-service
+    x-consumers:
+      - service: yandex-service
+        durable: yandex-metrica-cleanup-completed
+        filter_subject: events.metrica.cleanup.completed
+        mode: pull
+        deliver_policy: all
+        ack_policy: explicit
+        ack_wait_seconds: 30
+        max_deliver: -1
+      - service: seo-service
+        durable: seo-metrica-cleanup-completed
+        filter_subject: events.metrica.cleanup.completed
+        mode: pull
+        deliver_policy: all
+        ack_policy: explicit
+        ack_wait_seconds: 30
+        max_deliver: -1
+    publish:
+      operationId: publishCleanupCompleted
+      description: >-
+        Result persisted atomically with completion in outbox; publish outside transaction, mark only after
+        PubAck. Retry indefinitely 1..60s; no false completed. Worker/outbox relay implemented separately.
+      message:
+        $ref: '#/components/messages/CleanupCompleted'
+  events.metrica.pages.merge.completed:
+    x-stream: METRICA_MAINTENANCE_RESULTS
+    x-owner: ya-metrica-service
+    x-consumers:
+      - service: seo-service
+        durable: seo-metrica-pages-merge-completed
+        filter_subject: events.metrica.pages.merge.completed
+        mode: pull
+        deliver_policy: all
+        ack_policy: explicit
+        ack_wait_seconds: 30
+        max_deliver: -1
+    publish:
+      operationId: publishMergeCompleted
+      description: >-
+        Result persisted atomically with completion in outbox; publish outside transaction, mark only after
+        PubAck. Retry indefinitely 1..60s; no false completed. Worker/outbox relay implemented separately.
+      message:
+        $ref: '#/components/messages/MergeCompleted'
 components:
   messages:
     ParseCommand:
@@ -42,32 +155,92 @@ components:
         $ref: '#/components/schemas/IdempotencyHeaders'
       payload:
         $ref: '#/components/schemas/ParseCommandPayload'
+    CleanupRequested:
+      name: CleanupRequested
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/CleanupRequested'
+    MergeCommand:
+      name: MergeCommand
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/MergeCommand'
+    MergeFinalized:
+      name: MergeFinalized
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/MergeFinalized'
+    CleanupCompleted:
+      name: CleanupCompleted
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/CleanupCompleted'
+    MergeCompleted:
+      name: MergeCompleted
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/MergeCompleted'
   schemas:
     IdempotencyHeaders:
       type: object
-      required: [Nats-Msg-Id]
+      required:
+        - Nats-Msg-Id
       description: >-
-        NAMESPACE_PARSE_COMMANDS = uuid5(NAMESPACE_DNS, "parse-commands.eqcms").
-        Nats-Msg-Id = uuid5(NAMESPACE_PARSE_COMMANDS, "<provider>:<job_id>"),
-        уникален в stream. Дополнительные транспортные заголовки допустимы.
+        NAMESPACE_PARSE_COMMANDS = uuid5(NAMESPACE_DNS, "parse-commands.eqcms"). Nats-Msg-Id =
+        uuid5(NAMESPACE_PARSE_COMMANDS, "<provider>:<job_id>"), уникален в stream. Дополнительные транспортные
+        заголовки допустимы.
       properties:
-        Nats-Msg-Id: {type: string, format: uuid}
+        Nats-Msg-Id:
+          type: string
+          format: uuid
     ParseCommandPayload:
       type: object
       additionalProperties: false
-      required: [schema_version, occurred_at, job_id, provider, equestrian_id, trigger, window, params]
+      required:
+        - schema_version
+        - occurred_at
+        - job_id
+        - provider
+        - equestrian_id
+        - trigger
+        - window
+        - params
       properties:
-        schema_version: {type: integer, enum: [1]}
-        occurred_at: {type: string, format: date-time}
+        schema_version:
+          type: integer
+          enum:
+            - 1
+        occurred_at:
+          type: string
+          format: date-time
         job_id:
           type: string
           format: uuid
           description: >-
             manual — uuid4(); schedule — uuid5(NAMESPACE_PARSE_COMMANDS,
             "schedule:<provider>:<equestrian_id>:<локальная дата слота>").
-        provider: {type: string, enum: [ya_metrica]}
-        equestrian_id: {type: string, format: uuid}
-        trigger: {type: string, enum: [schedule, manual]}
+        provider:
+          type: string
+          enum:
+            - ya_metrica
+        equestrian_id:
+          type: string
+          format: uuid
+        trigger:
+          type: string
+          enum:
+            - schedule
+            - manual
         window:
           oneOf:
             - $ref: '#/components/schemas/AutoWindow'
@@ -79,14 +252,439 @@ components:
     AutoWindow:
       type: object
       additionalProperties: false
-      required: [mode]
+      required:
+        - mode
       properties:
-        mode: {type: string, enum: [auto]}
+        mode:
+          type: string
+          enum:
+            - auto
     ExplicitWindow:
       type: object
       additionalProperties: false
-      required: [mode, date_from, date_to]
+      required:
+        - mode
+        - date_from
+        - date_to
       properties:
-        mode: {type: string, enum: [explicit]}
-        date_from: {type: string, format: date}
-        date_to: {type: string, format: date}
+        mode:
+          type: string
+          enum:
+            - explicit
+        date_from:
+          type: string
+          format: date
+        date_to:
+          type: string
+          format: date
+    CleanupRequested:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        cleanup_seq:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Cleanup Seq
+          type: integer
+        binding_generation:
+          maximum: 9223372036854775807
+          minimum: 0
+          title: Binding Generation
+          type: integer
+        reason:
+          enum:
+            - counter_unlinked
+            - account_deleted
+          title: Reason
+          type: string
+      required:
+        - schema_version
+        - message_id
+        - operation_id
+        - equestrian_id
+        - occurred_at
+        - cleanup_seq
+        - binding_generation
+        - reason
+      title: CleanupRequested
+      type: object
+    CleanupCompleted:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        cleanup_seq:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Cleanup Seq
+          type: integer
+        status:
+          const: completed
+          title: Status
+          type: string
+      required:
+        - schema_version
+        - message_id
+        - operation_id
+        - equestrian_id
+        - occurred_at
+        - cleanup_seq
+        - status
+      title: CleanupCompleted
+      type: object
+    PageMapping:
+      additionalProperties: false
+      properties:
+        source_page_id:
+          format: uuid
+          title: Source Page Id
+          type: string
+        target_page_id:
+          format: uuid
+          title: Target Page Id
+          type: string
+      required:
+        - source_page_id
+        - target_page_id
+      title: PageMapping
+      type: object
+      description: >-
+        Source != target; source unique within part and across revision (producer membership/tenant
+        verification required).
+    MergeMappings:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        kind:
+          const: mappings
+          title: Kind
+          type: string
+        part_index:
+          maximum: 9223372036854775807
+          minimum: 0
+          title: Part Index
+          type: integer
+        mappings:
+          items:
+            $ref: '#/components/schemas/PageMapping'
+          maxItems: 500
+          minItems: 1
+          title: Mappings
+          type: array
+      required:
+        - schema_version
+        - message_id
+        - operation_id
+        - equestrian_id
+        - occurred_at
+        - normalization_revision
+        - kind
+        - part_index
+        - mappings
+      title: MergeMappings
+      type: object
+    MergeSeal:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        kind:
+          const: seal
+          title: Kind
+          type: string
+        part_count:
+          maximum: 9223372036854775807
+          minimum: 0
+          title: Part Count
+          type: integer
+      required:
+        - schema_version
+        - message_id
+        - operation_id
+        - equestrian_id
+        - occurred_at
+        - normalization_revision
+        - kind
+        - part_count
+      title: MergeSeal
+      type: object
+    MergeFinalized:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        result_message_id:
+          format: uuid
+          title: Result Message Id
+          type: string
+      required:
+        - schema_version
+        - message_id
+        - operation_id
+        - equestrian_id
+        - occurred_at
+        - normalization_revision
+        - result_message_id
+      title: MergeFinalized
+      type: object
+    MergeCompleted:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        status:
+          enum:
+            - completed
+            - superseded_by_delete
+          title: Status
+          type: string
+        part_count:
+          anyOf:
+            - maximum: 9223372036854775807
+              minimum: 0
+              type: integer
+            - type: 'null'
+          title: Part Count
+        cleanup_operation_id:
+          anyOf:
+            - format: uuid
+              type: string
+            - type: 'null'
+          default: null
+          title: Cleanup Operation Id
+        cleanup_seq:
+          anyOf:
+            - exclusiveMinimum: 0
+              maximum: 9223372036854775807
+              type: integer
+            - type: 'null'
+          default: null
+          title: Cleanup Seq
+      required:
+        - schema_version
+        - message_id
+        - operation_id
+        - equestrian_id
+        - occurred_at
+        - normalization_revision
+        - status
+        - part_count
+      title: MergeCompleted
+      type: object
+      description: >-
+        completed requires non-null part_count and no cleanup correlation. superseded_by_delete requires
+        cleanup_operation_id and cleanup_seq; part_count may be null until seal. SEO waits for cleanup
+        completion before deleting sources.
+      oneOf:
+        - properties:
+            status:
+              const: completed
+            part_count:
+              type: integer
+              minimum: 0
+            cleanup_operation_id:
+              type: 'null'
+            cleanup_seq:
+              type: 'null'
+        - required:
+            - cleanup_operation_id
+            - cleanup_seq
+          properties:
+            status:
+              const: superseded_by_delete
+            cleanup_operation_id:
+              type: string
+              format: uuid
+            cleanup_seq:
+              type: integer
+              minimum: 1
+              maximum: 9223372036854775807
+    MergeCommand:
+      oneOf:
+        - $ref: '#/components/schemas/MergeMappings'
+        - $ref: '#/components/schemas/MergeSeal'
+    MaintenanceHeaders:
+      type: object
+      required:
+        - Nats-Msg-Id
+      properties:
+        Nats-Msg-Id:
+          type: string
+          format: uuid
+          description: Равен payload.message_id и детерминированному ID subject/operation/kind.
+x-streams:
+  YANDEX_LIFECYCLE:
+    owner: yandex-service
+    subjects:
+      - events.yandex.metrica.cleanup.requested
+    storage: file
+    retention: limits
+    max_age: 0
+    max_msgs: -1
+    max_bytes: -1
+    discard: new
+    duplicate_window_seconds: 120
+  SEO_MAINTENANCE:
+    owner: seo-service
+    subjects:
+      - commands.seo.pages.merge
+      - events.seo.pages.merge.finalized
+    storage: file
+    retention: limits
+    max_age: 0
+    max_msgs: -1
+    max_bytes: -1
+    discard: new
+    duplicate_window_seconds: 120
+  METRICA_MAINTENANCE_RESULTS:
+    owner: ya-metrica-service
+    subjects:
+      - events.metrica.cleanup.completed
+      - events.metrica.pages.merge.completed
+    storage: file
+    retention: limits
+    max_age: 0
+    max_msgs: -1
+    max_bytes: -1
+    discard: new
+    duplicate_window_seconds: 120
+x-message-identity: >-
+  message_id = Nats-Msg-Id = uuid5(NAMESPACE_URL, "eqcms:maintenance:v1:<subject>:<operation_id>:<kind>").
+  kind=requested (cleanup request), part_index (mappings), seal, completed (cleanup result),
+  completed|superseded_by_delete (merge result), finalized:<result_message_id> (finalized). Producer persists
+  the full envelope once; PubAck.duplicate is warning and successful delivery. Inbox hash ensures replay
+  safety outside broker window.
+x-maintenance-readiness: >-
+  M-3b: explicit setup_maintenance + lazy consumer factory only; not active in lifespan. Runtime
+  supervision/replay belongs to M-3d after readiness gates. Internal Trusted Network Write; production
+  requires network isolation. No HTTP changes.

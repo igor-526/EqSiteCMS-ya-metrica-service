@@ -5,6 +5,7 @@ from sqlalchemy import (
     Computed,
     Date,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     Table,
@@ -56,3 +57,7 @@ def _stats_table(name: str, entity_column: str) -> Table:
 
 metrica_page_stats = _stats_table("metrica_page_stats", "page_id")
 metrica_search_query_stats = _stats_table("metrica_search_query_stats", "search_query_id")
+
+# Keyset cleanup must not scan unrelated tenants or use OFFSET.
+for _table in (metrica_page_stats, metrica_search_query_stats):
+    Index(f"ix_{_table.name}_tenant_pk", _table.c.equestrian_id, _table.c.id)

@@ -23,7 +23,12 @@ ACCOUNT = UUID("799c85a2-1f16-4477-9ef5-cb44ee4b81b2")
     ],
 )
 async def test_binding_y7_actual_nested_account_contract(mock_transport, counter):
-    captured = mock_transport(lambda request: httpx.Response(200, json={"counter": counter}))
+    captured = mock_transport(
+        lambda request: httpx.Response(
+            200,
+            json={"counter": counter, "binding_generation": 3, "cleanup_requested_seq": 2, "cleanup_completed_seq": 2},
+        )
+    )
     result = await YandexServiceClient("http://yandex.test/").get_metrica_binding(equestrian_id=TENANT)
     if counter is None:
         assert result.counter is None
@@ -89,3 +94,39 @@ async def test_yandex_service_network_failure(mock_transport, cause, category):
     with pytest.raises(PeerServiceException) as error:
         await YandexServiceClient("http://yandex.test").get_metrica_binding(equestrian_id=TENANT)
     assert (error.value.status, error.value.category) == (None, category)
+
+
+@pytest.mark.parametrize("field", ["binding_generation", "cleanup_requested_seq", "cleanup_completed_seq"])
+@pytest.mark.parametrize("value", [None, -1, True, "2", 1.5])
+async def test_parse_lifecycle_fields_fail_closed(mock_transport, field, value):
+    payload = {"counter": None, "binding_generation": 3, "cleanup_requested_seq": 2, "cleanup_completed_seq": 2}
+    if value is None:
+        del payload[field]
+    else:
+        payload[field] = value
+    mock_transport(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(PeerServiceException) as exc:
+        await YandexServiceClient("http://yandex.test").get_metrica_binding(equestrian_id=TENANT)
+    assert (exc.value.service, exc.value.status, exc.value.category) == ("yandex", 200, "response")
+
+
+@pytest.mark.parametrize(
+    "counter", [None, {"equestrian_id": str(TENANT), "counter_id": "123", "yandex_account": {"id": str(ACCOUNT)}}]
+)
+async def test_parse_lifecycle_incoherent_watermark_fail_closed(mock_transport, counter):
+    payload = {"counter": counter, "binding_generation": 3, "cleanup_requested_seq": 1, "cleanup_completed_seq": 2}
+    mock_transport(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(PeerServiceException):
+        await YandexServiceClient("http://yandex.test").get_metrica_binding(equestrian_id=TENANT)
+
+
+async def test_parse_existing_binding_requires_nonlegacy_generation(mock_transport):
+    payload = {
+        "counter": {"equestrian_id": str(TENANT), "counter_id": "123", "yandex_account": {"id": str(ACCOUNT)}},
+        "binding_generation": 0,
+        "cleanup_requested_seq": 0,
+        "cleanup_completed_seq": 0,
+    }
+    mock_transport(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(PeerServiceException):
+        await YandexServiceClient("http://yandex.test").get_metrica_binding(equestrian_id=TENANT)

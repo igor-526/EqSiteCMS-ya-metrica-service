@@ -24,11 +24,21 @@ class NatsConsumerClientProtocol(Protocol):
 
 class ParseRunConsumer:
     def __init__(
-        self, *, client: NatsConsumerClientProtocol, settings: NatsSettings, handler: ParseRunHandlerProtocol
+        self,
+        *,
+        client: NatsConsumerClientProtocol,
+        settings: NatsSettings,
+        handler: ParseRunHandlerProtocol,
+        route: tuple[str, str, str] | None = None,
     ) -> None:
         self._client = client
         self._settings = settings
         self._handler = handler
+        self._stream, self._subject, self._durable = route or (
+            settings.nats_stream_parse_commands,
+            settings.nats_subject_parse_run,
+            settings.nats_consumer_parse_run,
+        )
         self._task: asyncio.Task[None] | None = None
         self._subscription: JetStreamContext.PullSubscription | None = None
 
@@ -40,11 +50,11 @@ class ParseRunConsumer:
         if self.is_running:
             return
         self._subscription = await self._client.jetstream.pull_subscribe(
-            subject=self._settings.nats_subject_parse_run,
-            durable=self._settings.nats_consumer_parse_run,
-            stream=self._settings.nats_stream_parse_commands,
+            subject=self._subject,
+            durable=self._durable,
+            stream=self._stream,
         )
-        self._task = asyncio.create_task(self._consume(), name="metrica-parse-run-consumer")
+        self._task = asyncio.create_task(self._consume(), name=f"metrica-{self._durable}-consumer")
 
     async def wait(self) -> None:
         if self._task is not None:

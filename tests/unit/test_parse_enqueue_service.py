@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from core.entities.metrica_maintenance import IntentAdmission
 from core.entities.metrica_parse import ParseKind
 from core.exceptions import (
     ClientError,
@@ -45,11 +46,14 @@ def env():
     eq, account = uuid4(), uuid4()
     binding = MetricaBinding.model_validate(
         {
+            "binding_generation": 3,
+            "cleanup_requested_seq": 2,
+            "cleanup_completed_seq": 2,
             "counter": {
                 "counter_id": "123",
                 "equestrian_id": eq,
                 "yandex_account": {"id": account},
-            }
+            },
         }
     )
 
@@ -58,35 +62,42 @@ def env():
         events.append("y7")
         return binding
 
-    async def lock(equestrian_id):
-        assert equestrian_id == eq
-        events.append("lock")
+    async def enqueue_intent(intent, *, lifecycle):
+        assert intent.equestrian_id == eq
+        assert lifecycle.binding_generation == 3
+        assert lifecycle.cleanup_requested_seq == 2
+        events.append("intent")
+        return IntentAdmission.READY
 
-    async def active(equestrian_id):
-        assert equestrian_id == eq
-        events.append("active")
-        return False
+    async def prepare(intent, *, lifecycle):
+        events.append("prepare")
+        if lifecycle.account_id is None:
+            return IntentAdmission.MISSING_BINDING
+        return IntentAdmission.READY
 
     async def last(equestrian_id):
         assert equestrian_id == eq
         events.append("last")
         return date(2026, 10, 20)
 
-    async def create(run, tasks):
+    async def consume(intent, *, lifecycle, run, tasks):
         assert run.equestrian_id == eq
-        events.append("create")
-        return True
+        assert run.job_id == intent.job_id
+        assert run.binding_generation == lifecycle.binding_generation == 3
+        assert run.observed_cleanup_requested_seq == lifecycle.cleanup_requested_seq == 2
+        assert all(t.binding_generation == 3 and t.observed_cleanup_requested_seq == 2 for t in tasks)
+        events.append("consume")
+        return IntentAdmission.ADMITTED
 
     async def dispatch(account_id):
         assert account_id == account
         events.append("dispatch")
 
     client = SimpleNamespace(get_metrica_binding=AsyncMock(side_effect=get_binding))
-    runs = SimpleNamespace(
-        lock_equestrian=AsyncMock(side_effect=lock),
-        exists_job=AsyncMock(return_value=False),
-        has_active_tasks=AsyncMock(side_effect=active),
-        create_run_with_tasks=AsyncMock(side_effect=create),
+    intents = SimpleNamespace(
+        enqueue_intent=AsyncMock(side_effect=enqueue_intent),
+        prepare_admission=AsyncMock(side_effect=prepare),
+        consume_intent=AsyncMock(side_effect=consume),
     )
     pages = SimpleNamespace(get_last_stat_date=AsyncMock(side_effect=last))
     search = SimpleNamespace(get_last_stat_date=AsyncMock(return_value=date(2026, 10, 25)))
@@ -94,7 +105,7 @@ def env():
     service = ParseEnqueueService(
         yandex_client=client,
         transaction=FakeTransaction(events),
-        run_repository=runs,
+        intent_repository=intents,
         pages_repository=pages,
         search_queries_repository=search,
         date_resolver=DateRangeResolver(clock=lambda: datetime(2026, 10, 26, 12, tzinfo=UTC)),
@@ -107,11 +118,12 @@ def env():
 
 async def test_enqueue_auto_transaction_and_safe_output(env):
     result = await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
-    assert env.events == ["y7", "begin", "lock", "active", "last", "create", "commit", "dispatch"]
+    assert env.events == ["y7", "begin", "intent", "prepare", "last", "consume", "commit", "dispatch"]
     env.search.get_last_stat_date.assert_awaited_once_with(env.eq)
+    assert result is not None
     assert result.ranges[ParseKind.PAGES].date_from == date(2026, 10, 20)
     assert result.ranges[ParseKind.SEARCH_QUERIES].date_from == date(2026, 10, 25)
-    run, tasks = env.runs.create_run_with_tasks.call_args.args
+    run, tasks = (env.intents.consume_intent.call_args.kwargs[k] for k in ("run", "tasks"))
     assert result.run_id == run.id
     assert [t.id for t in result.tasks] == [t.id for t in tasks]
     assert len(tasks) == 3
@@ -137,6 +149,7 @@ async def test_explicit_clamp_logged_without_auto_queries(env, caplog):
                 date_to=date(2027, 1, 1),
             )
         )
+    assert result is not None
     assert result.clamped
     assert result.date_mode == "explicit"
     assert result.ranges[ParseKind.PAGES].date_to == date(2026, 10, 26)
@@ -156,16 +169,18 @@ async def test_y7_failure_before_transaction(env, category, status):
         await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
     assert isinstance(exc.value, ClientError)
     assert env.events == []
-    env.runs.create_run_with_tasks.assert_not_awaited()
+    env.intents.consume_intent.assert_not_awaited()
     env.dispatcher.dispatch_account.assert_not_awaited()
 
 
 async def test_missing_binding(env):
     env.client.get_metrica_binding.side_effect = None
-    env.client.get_metrica_binding.return_value = MetricaBinding(counter=None)
+    env.client.get_metrica_binding.return_value = MetricaBinding(
+        counter=None, binding_generation=3, cleanup_requested_seq=2, cleanup_completed_seq=2
+    )
     with pytest.raises(MetricaBindingMissingError, match="Счётчик Яндекс.Метрики не привязан к конюшне"):
         await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
-    assert env.events == []
+    assert env.events == ["begin", "intent", "prepare", "commit"]
 
 
 async def test_wrong_equestrian_binding(env):
@@ -175,18 +190,15 @@ async def test_wrong_equestrian_binding(env):
     assert env.events == ["y7"]
 
 
-@pytest.mark.parametrize("at_create", [False, True])
-async def test_active_run_rejected_and_rolled_back(env, at_create):
-    mock = env.runs.create_run_with_tasks if at_create else env.runs.has_active_tasks
-    mock.side_effect = None
-    mock.return_value = not at_create
-    with pytest.raises(ParseAlreadyActiveError, match="Парсинг конюшни уже выполняется"):
+async def test_active_run_rejected_and_rolled_back(env):
+    env.intents.enqueue_intent.side_effect = None
+    env.intents.enqueue_intent.return_value = IntentAdmission.ACTIVE_RUN
+    with pytest.raises(ParseAlreadyActiveError):
         await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
     assert env.events[-1] == "rollback"
+    env.intents.prepare_admission.assert_not_awaited()
+    env.pages.get_last_stat_date.assert_not_awaited()
     env.dispatcher.dispatch_account.assert_not_awaited()
-    if not at_create:
-        env.pages.get_last_stat_date.assert_not_awaited()
-        env.runs.create_run_with_tasks.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -195,13 +207,13 @@ async def test_active_run_rejected_and_rolled_back(env, at_create):
 async def test_bad_dates_rollback_without_create(env, start, end):
     with pytest.raises(ParseRangeError):
         await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq, date_from=start, date_to=end))
-    assert env.events[-1] == "rollback"
-    env.runs.create_run_with_tasks.assert_not_awaited()
+    assert "commit" not in env.events
+    env.intents.consume_intent.assert_not_awaited()
     env.dispatcher.dispatch_account.assert_not_awaited()
 
 
 async def test_database_failure_rolls_back(env):
-    env.runs.create_run_with_tasks.side_effect = RuntimeError("database failure")
+    env.intents.consume_intent.side_effect = RuntimeError("database failure")
     with pytest.raises(RuntimeError):
         await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
     assert env.events[-1] == "rollback"
@@ -225,6 +237,7 @@ async def test_dispatch_failure_after_commit_is_only_safe_warning(env, caplog):
     env.dispatcher.dispatch_account.side_effect = RuntimeError("redis://secret-token")
     with caplog.at_level(logging.WARNING):
         result = await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
+    assert result is not None
     assert result.tasks
     assert env.events[-1] == "commit"
     assert "dispatch failed after commit" in caplog.text
@@ -232,39 +245,24 @@ async def test_dispatch_failure_after_commit_is_only_safe_warning(env, caplog):
     assert "Traceback" not in caplog.text
 
 
-async def test_ut_mp_04_job_id_persisted_and_null_compatible(env):
+async def test_ut_mp_04_job_id_persisted_and_legacy_nulls_unchanged(env):
     job_id = uuid4()
     await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=job_id)
-    env.runs.exists_job.assert_awaited_once_with(job_id)
-    run, _ = env.runs.create_run_with_tasks.call_args.args
-    assert run.job_id == job_id
-    env.runs.exists_job.reset_mock()
-    await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=None)
-    run, _ = env.runs.create_run_with_tasks.call_args.args
-    assert run.job_id is None
-    env.runs.exists_job.assert_not_awaited()
+    assert env.intents.consume_intent.call_args.kwargs["run"].job_id == job_id
+    await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq))
+    assert env.intents.consume_intent.call_args.kwargs["run"].job_id is not None
 
 
 async def test_ut_mp_04_redelivery_no_tasks_no_dispatch(env):
     from core.exceptions.parse import ParseJobAlreadyExistsError
 
-    job_id = uuid4()
-    await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=job_id)
-    for mock in (
-        env.runs.create_run_with_tasks,
-        env.dispatcher.dispatch_account,
-        env.runs.has_active_tasks,
-        env.pages.get_last_stat_date,
-        env.search.get_last_stat_date,
-    ):
-        mock.reset_mock()
-    env.runs.exists_job.return_value = True
+    env.intents.enqueue_intent.side_effect = None
+    env.intents.enqueue_intent.return_value = IntentAdmission.DUPLICATE
     with pytest.raises(ParseJobAlreadyExistsError):
-        await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=job_id)
-    env.runs.create_run_with_tasks.assert_not_awaited()
-    env.runs.has_active_tasks.assert_not_awaited()
+        await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=uuid4())
+    env.intents.prepare_admission.assert_not_awaited()
+    env.intents.consume_intent.assert_not_awaited()
     env.pages.get_last_stat_date.assert_not_awaited()
-    env.search.get_last_stat_date.assert_not_awaited()
     env.dispatcher.dispatch_account.assert_not_awaited()
     assert env.events[-1] == "rollback"
 
@@ -272,7 +270,7 @@ async def test_ut_mp_04_redelivery_no_tasks_no_dispatch(env):
 async def test_ut_mp_04_concurrent_duplicate_no_dispatch(env):
     from core.exceptions.parse import ParseJobAlreadyExistsError
 
-    env.runs.create_run_with_tasks.side_effect = ParseJobAlreadyExistsError()
+    env.intents.consume_intent.side_effect = ParseJobAlreadyExistsError()
     with pytest.raises(ParseJobAlreadyExistsError):
         await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=uuid4())
     env.dispatcher.dispatch_account.assert_not_awaited()
@@ -301,7 +299,7 @@ async def test_ut_mp_03_auto_command_windows_cover_every_day(env, last):
         "params": {},
     }
     await ParseRunHandler(service=env.service).handle(payload=json.dumps(body).encode())
-    run, tasks = env.runs.create_run_with_tasks.call_args.args
+    run, tasks = (env.intents.consume_intent.call_args.kwargs[k] for k in ("run", "tasks"))
     assert run.job_id == ParseCommand.model_validate(body).job_id
     assert run.date_mode == "auto"
     assert not run.clamped
@@ -323,3 +321,127 @@ async def test_ut_mp_03_auto_command_windows_cover_every_day(env, last):
             assert len(windows) == 1
             assert (windows[0].date_to - windows[0].date_from).days == 1
     env.dispatcher.dispatch_account.assert_awaited_once_with(env.account)
+
+
+@pytest.mark.parametrize("with_counter", [False, True])
+async def test_ut_d04_d06_maintenance_wait_commits_original_auto_intent(env, with_counter):
+    import json
+
+    from clients.nats.handlers.parse_run import ParseRunHandler
+    from tests.unit.test_parse_command_schema import command_payload
+
+    env.binding.cleanup_completed_seq = 1
+    if not with_counter:
+        env.binding.counter = None
+    env.intents.enqueue_intent.side_effect = None
+    env.intents.enqueue_intent.return_value = IntentAdmission.DEFERRED
+    env.intents.prepare_admission.side_effect = None
+    env.intents.prepare_admission.return_value = IntentAdmission.DEFERRED
+    body = command_payload(equestrian_id=str(env.eq))
+    await ParseRunHandler(service=env.service).handle(payload=json.dumps(body).encode())
+    assert env.events == ["y7", "begin", "commit"]
+    intent = env.intents.enqueue_intent.call_args.args[0]
+    snapshot = env.intents.enqueue_intent.call_args.kwargs["lifecycle"]
+    assert str(intent.job_id) == body["job_id"]
+    assert intent.date_mode == "auto" and intent.date_from is None and intent.date_to is None
+    assert snapshot.cleanup_requested_seq == 2 and snapshot.cleanup_completed_seq == 1
+    env.pages.get_last_stat_date.assert_not_awaited()
+    env.search.get_last_stat_date.assert_not_awaited()
+    env.intents.consume_intent.assert_not_awaited()
+    env.dispatcher.dispatch_account.assert_not_awaited()
+
+
+async def test_ut_d04_maintenance_wait_commit_failure_never_acks(env):
+    import json
+
+    from clients.nats.handlers.parse_run import ParseRunHandler
+    from tests.unit.test_parse_command_schema import command_payload
+
+    @asynccontextmanager
+    async def fail_commit():
+        yield
+        raise RuntimeError("commit failed")
+
+    env.service._transaction = SimpleNamespace(begin=fail_commit)
+    env.intents.prepare_admission.side_effect = None
+    env.intents.prepare_admission.return_value = IntentAdmission.DEFERRED
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await ParseRunHandler(service=env.service).handle(
+            payload=json.dumps(command_payload(equestrian_id=str(env.eq))).encode()
+        )
+    env.dispatcher.dispatch_account.assert_not_awaited()
+
+
+@pytest.mark.parametrize("decision", [IntentAdmission.DEFERRED, IntentAdmission.CANCELLED])
+async def test_ut_d04_consume_recheck_does_not_signal_unadmitted_work(env, decision):
+    env.intents.consume_intent.side_effect = None
+    env.intents.consume_intent.return_value = decision
+    assert await env.service.enqueue(data=ParseEnqueueInDto(equestrian_id=env.eq), job_id=uuid4()) is None
+    assert env.events[-1] == "commit"
+    env.dispatcher.dispatch_account.assert_not_awaited()
+
+
+async def test_ut_d06_replay_fetches_fresh_binding_and_auto_window(env):
+    from core.entities.metrica_maintenance import PendingParseIntent
+
+    intent = PendingParseIntent(uuid4(), env.eq, "auto")
+    # Maintenance has removed historical rows, so admission must re-read dates.
+    env.pages.get_last_stat_date.side_effect = None
+    env.pages.get_last_stat_date.return_value = None
+    env.search.get_last_stat_date.return_value = None
+    result = await env.service.replay_intent(intent)
+    assert result is not None
+    assert env.events == ["y7", "begin", "prepare", "consume", "commit", "dispatch"]
+    assert result.ranges[ParseKind.PAGES].date_from == date(2024, 10, 26)
+    run = env.intents.consume_intent.call_args.kwargs["run"]
+    assert run.job_id == intent.job_id
+    assert run.binding_generation == 3
+    env.intents.enqueue_intent.assert_not_awaited()
+
+
+@pytest.mark.parametrize("decision", [IntentAdmission.DEFERRED, IntentAdmission.CANCELLED, IntentAdmission.DUPLICATE])
+async def test_ut_d06_replay_rechecks_gate_active_run_and_terminal_state(env, decision):
+    from core.entities.metrica_maintenance import PendingParseIntent
+
+    env.intents.prepare_admission.side_effect = None
+    env.intents.prepare_admission.return_value = decision
+    assert await env.service.replay_intent(PendingParseIntent(uuid4(), env.eq, "auto")) is None
+    assert env.events == ["y7", "begin", "commit"]
+    env.intents.enqueue_intent.assert_not_awaited()
+    env.pages.get_last_stat_date.assert_not_awaited()
+    env.intents.consume_intent.assert_not_awaited()
+    env.dispatcher.dispatch_account.assert_not_awaited()
+
+
+async def test_ut_d06_replay_missing_binding_commits_terminal(env):
+    from core.entities.metrica_maintenance import PendingParseIntent
+
+    env.binding.counter = None
+    with pytest.raises(MetricaBindingMissingError):
+        await env.service.replay_intent(PendingParseIntent(uuid4(), env.eq, "auto"))
+    assert env.events == ["y7", "begin", "prepare", "commit"]
+    env.intents.enqueue_intent.assert_not_awaited()
+
+
+async def test_ut_d06_replay_outage_failclosed_before_transaction(env):
+    from core.entities.metrica_maintenance import PendingParseIntent
+
+    env.client.get_metrica_binding.side_effect = PeerServiceException("yandex", 503, "http")
+    with pytest.raises(YandexIntegrationUnavailableError):
+        await env.service.replay_intent(PendingParseIntent(uuid4(), env.eq, "auto"))
+    assert env.events == []
+    env.intents.prepare_admission.assert_not_awaited()
+
+
+async def test_ut_d06_replay_commit_failure_never_dispatches(env):
+    from core.entities.metrica_maintenance import PendingParseIntent
+
+    @asynccontextmanager
+    async def fail_commit():
+        yield
+        raise RuntimeError("commit failed")
+
+    env.service._transaction = SimpleNamespace(begin=fail_commit)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await env.service.replay_intent(PendingParseIntent(uuid4(), env.eq, "auto"))
+    env.dispatcher.dispatch_account.assert_not_awaited()

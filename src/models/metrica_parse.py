@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -24,8 +25,15 @@ metrica_parse_runs = Table(
     Column("job_id", UUID(as_uuid=True), nullable=True),
     Column("equestrian_id", UUID(as_uuid=True), nullable=False),
     Column("date_mode", String(8), nullable=False),
+    Column("binding_generation", BigInteger, nullable=False, server_default="0"),
+    Column("observed_cleanup_requested_seq", BigInteger, nullable=False, server_default="0"),
     Column("clamped", Boolean, nullable=False, server_default=text("false")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("equestrian_id", "id", name="ux_metrica_parse_runs_tenant_id"),
+    CheckConstraint(
+        "binding_generation >= 0 AND observed_cleanup_requested_seq >= 0",
+        name="ck_metrica_parse_runs_lifecycle",
+    ),
     CheckConstraint("date_mode IN ('explicit', 'auto')", name="ck_metrica_parse_runs_date_mode"),
 )
 
@@ -43,6 +51,9 @@ metrica_parse_tasks = Table(
     Column("date_from", Date, nullable=False),
     Column("date_to", Date, nullable=False),
     Column("sequence", Integer, nullable=False),
+    Column("binding_generation", BigInteger, nullable=False, server_default="0"),
+    Column("observed_cleanup_requested_seq", BigInteger, nullable=False, server_default="0"),
+    Column("fencing_revision", BigInteger, nullable=False, server_default="0"),
     Column("status", String(9), nullable=False, server_default="queued"),
     Column("attempts", Integer, nullable=False, server_default="0"),
     Column("max_attempts", Integer, nullable=False),
@@ -61,7 +72,13 @@ metrica_parse_tasks = Table(
     Column("error_status", Integer),
     *timestamp_columns(),
     CheckConstraint("kind IN ('pages', 'search_queries')", name="ck_metrica_parse_tasks_kind"),
-    CheckConstraint("status IN ('queued', 'running', 'succeeded', 'failed')", name="ck_metrica_parse_tasks_status"),
+    CheckConstraint(
+        "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')", name="ck_metrica_parse_tasks_status"
+    ),
+    CheckConstraint(
+        "binding_generation >= 0 AND observed_cleanup_requested_seq >= 0 AND fencing_revision >= 0",
+        name="ck_metrica_parse_tasks_lifecycle",
+    ),
     CheckConstraint("date_from <= date_to AND date_to - date_from <= 4", name="ck_metrica_parse_tasks_window"),
     CheckConstraint("attempts >= 0 AND max_attempts > 0", name="ck_metrica_parse_tasks_attempts"),
     CheckConstraint("next_offset >= 1", name="ck_metrica_parse_tasks_offset"),

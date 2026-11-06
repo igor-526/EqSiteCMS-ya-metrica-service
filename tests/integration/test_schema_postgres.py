@@ -18,7 +18,7 @@ from models import metrica_page_stats, metrica_parse_runs, metrica_parse_tasks, 
 from utils.basemodel import metadata
 
 CONFIG_PATH = Path(__file__).parents[2] / "src" / "alembic.ini"
-TABLES = {"metrica_parse_runs", "metrica_parse_tasks", "metrica_page_stats", "metrica_search_query_stats"}
+TABLES = set(metadata.tables)
 
 
 def _migrate(connection, target, *, downgrade=False):
@@ -35,13 +35,13 @@ def _migrate(connection, target, *, downgrade=False):
         context.run_migrations()
 
 
-async def test_it_ms_01_upgrade_downgrade_upgrade(pg_schema_engine):
+async def test_it_ms_01_upgrade_and_retained_maintenance_ledger(pg_schema_engine):
     async with pg_schema_engine.begin() as connection:
         await connection.run_sync(lambda conn: _migrate(conn, "head"))
         assert set(await connection.run_sync(lambda conn: inspect(conn).get_table_names())) == TABLES | {
             "alembic_version"
         }
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "20261028_0003"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "20261102_0004"
         assert (
             await connection.run_sync(lambda conn: compare_metadata(MigrationContext.configure(conn), metadata)) == []
         )
@@ -97,10 +97,9 @@ async def test_it_ms_01_upgrade_downgrade_upgrade(pg_schema_engine):
             assert inspector.get_unique_constraints("metrica_parse_tasks")[0]["column_names"] == ["run_id", "sequence"]
 
         await connection.run_sync(inspect_schema)
-        await connection.run_sync(lambda conn: _migrate(conn, "base", downgrade=True))
-        assert set(await connection.run_sync(lambda conn: inspect(conn).get_table_names())) == {"alembic_version"}
-        assert await connection.scalar(text("SELECT count(*) FROM alembic_version")) == 0
-        await connection.run_sync(lambda conn: _migrate(conn, "head"))
+        # Maintenance barriers/results must not disappear through a generic rollback.
+        with pytest.raises(RuntimeError, match="must be retained"):
+            await connection.run_sync(lambda conn: _migrate(conn, "base", downgrade=True))
         assert set(await connection.run_sync(lambda conn: inspect(conn).get_table_names())) == TABLES | {
             "alembic_version"
         }

@@ -24,6 +24,12 @@ class ParseJobFactory:
 
     async def create(self, *, task: ParseTask) -> ParseJob:
         binding = await self._yandex.get_metrica_binding(equestrian_id=task.equestrian_id)
+        if (
+            task.binding_generation == 0
+            or binding.binding_generation != task.binding_generation  # noqa: W503
+            or binding.cleanup_completed_seq > task.observed_cleanup_requested_seq  # noqa: W503
+        ):
+            raise ParseExecutionError(ParseErrorCode.BINDING_CHANGED)
         counter = binding.counter
         if counter is None:
             raise ParseExecutionError(ParseErrorCode.BINDING_CHANGED)

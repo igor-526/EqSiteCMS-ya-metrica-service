@@ -94,7 +94,7 @@ def test_parse_graph_shares_one_session_without_global_override():
         assert runner._transaction is runner._ingestion._transaction is session
         assert enqueue._transaction is dispatch._transaction is session
         assert runner._tasks.session is runner._ingestion._tasks.session is session
-        assert enqueue._runs.session is session
+        assert enqueue._intents.session is session
         for kind in ParseKind:
             assert runner._stats[kind].session is runner._ingestion._stats[kind].session is session
             assert enqueue._stats[kind].session is session

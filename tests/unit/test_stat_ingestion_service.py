@@ -64,7 +64,13 @@ def env():
 
     pages = SimpleNamespace(upsert=AsyncMock(side_effect=upsert))
     search = SimpleNamespace(upsert=AsyncMock(side_effect=upsert))
-    tasks = SimpleNamespace(save_checkpoint=AsyncMock(side_effect=checkpoint))
+
+    async def guard(*args, **kwargs):
+        events.append("guard")
+
+    tasks = SimpleNamespace(
+        assert_writable=AsyncMock(side_effect=guard), save_checkpoint=AsyncMock(side_effect=checkpoint)
+    )
     client = SimpleNamespace(get_stat_page=AsyncMock(return_value=StatPage(data=[raw()], total_rows=1)))
     seo = SimpleNamespace(
         resolve_pages=AsyncMock(side_effect=resolve), resolve_search_queries=AsyncMock(side_effect=resolve)
@@ -91,7 +97,7 @@ async def test_additive_metrics_and_atomic_checkpoint(env):
     assert row.equestrian_id == env.task.equestrian_id
     assert row.entity_id == env.entity
     assert counts.inserted == 1 and counts.pages == 1 and counts.skipped == 0
-    assert env.events == ["begin", "upsert", "checkpoint", "commit"]
+    assert env.events == ["begin", "guard", "upsert", "checkpoint", "commit"]
     env.tasks.save_checkpoint.assert_awaited_once_with(
         env.task.id,
         locked_by="worker",
@@ -193,6 +199,8 @@ async def test_weighted_aggregation_per_date(env):
     first, second = env.writes[0]
     assert (first.visits, first.pageviews, first.bounces, first.visit_duration_seconds) == (4, 7, 1, 320)
     assert second.visits == 100 and second.bounces == 1
+    assert first.users == 3 and second.users == 2  # additive, never cross-page distinct
+    assert first.stat_date != second.stat_date
 
 
 async def test_bisection_and_skip_counts_each_source_occurrence(env):
@@ -267,7 +275,7 @@ async def test_second_page_failure_keeps_committed_checkpoint(env):
     ]
     with pytest.raises(PeerServiceException):
         await env.service.ingest(job=env.job, locked_by="worker")
-    assert env.events == ["begin", "upsert", "checkpoint", "commit"]
+    assert env.events == ["begin", "guard", "upsert", "checkpoint", "commit"]
     assert env.tasks.save_checkpoint.call_args.kwargs["next_offset"] == 11
     assert env.task.next_offset == 11 and env.task.rows_fetched == 10
 
@@ -292,3 +300,53 @@ async def test_resolve_bad_length_rejected_before_page_transaction(env):
     with pytest.raises(ParseExecutionError, match="seo_rejected"):
         await env.service.ingest(job=env.job, locked_by="worker")
     assert env.events == []
+
+
+async def test_ut_d_05_guard_loss_prevents_page_write(env):
+    env.tasks.assert_writable.side_effect = LeaseLostError()
+    with pytest.raises(LeaseLostError):
+        await env.service.ingest(job=env.job, locked_by="worker")
+    assert env.events == ["begin", "rollback"]
+    env.pages.upsert.assert_not_awaited()
+    env.tasks.save_checkpoint.assert_not_awaited()
+    assert env.task.next_offset == 1 and env.task.pages_fetched == 0
+
+
+async def test_ut_d_05_guard_is_reacquired_for_each_page(env):
+    env.client.get_stat_page.side_effect = [
+        StatPage(data=[raw()] * 10, total_rows=20),
+        StatPage(data=[raw()] * 10, total_rows=20),
+    ]
+    calls = 0
+
+    async def guard(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise LeaseLostError()
+        env.events.append("guard")
+
+    env.tasks.assert_writable.side_effect = guard
+    with pytest.raises(LeaseLostError):
+        await env.service.ingest(job=env.job, locked_by="worker")
+    assert env.events == ["begin", "guard", "upsert", "checkpoint", "commit", "begin", "rollback"]
+    env.pages.upsert.assert_awaited_once()
+    assert env.task.next_offset == 11 and env.task.pages_fetched == 1
+
+
+async def test_fresh_parse_after_merge_resolves_sources_to_canonical_per_page(env):
+    # SEO aliases resolve old source URLs to the surviving target after finalized.
+    # No merge aggregate is fed back to ingestion: each page carries fresh totals.
+    env.service._limit = 2
+    env.client.get_stat_page.side_effect = [
+        StatPage(data=[raw("old-source-a"), raw("old-source-b")], total_rows=3),
+        StatPage(data=[raw("canonical")], total_rows=3),
+    ]
+    counts = await env.service.ingest(job=env.job, locked_by="fresh-worker")
+    assert counts.pages == 2 and len(env.writes) == 2
+    assert [rows[0].visits for rows in env.writes] == [60, 30]
+    assert [rows[0].users for rows in env.writes] == [60, 30]
+    assert all(len(rows) == 1 and rows[0].entity_id == env.entity for rows in env.writes)
+    assert all(rows[0].parse_task_id == env.task.id for rows in env.writes)
+    assert env.events == ["begin", "guard", "upsert", "checkpoint", "commit"] * 2
+    assert env.task.next_offset == 4

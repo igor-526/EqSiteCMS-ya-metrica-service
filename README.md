@@ -17,6 +17,7 @@ PG/NATS acceptance остаётся открытым; merge algorithm — тол
 | M4 | GET | `/api/metrica/page-stats/ranking` | Private Peer Read exception; seo-service | 200 / ошибка 400 | то же |
 | M5 | GET | `/api/metrica/search-query-stats/table` | Private Peer Read exception; доверенный seo-service | 200 / ошибка 400 | то же |
 | M6 | GET | `/api/metrica/search-query-stats/ranking` | Private Peer Read exception; доверенный seo-service | 200 / ошибка 400 | то же |
+| M7 | GET | `/api/metrica/tasks` | Internal Trusted Network Read exception; CMS backend | UUID selector: 200 / query 400; missing/invalid selector: 401 | то же, credentials игнорируются |
 | H1 | GET | `/health` | Public Read; любой | 200 | то же |
 
 M1 получает зашифрованный `access_token` в query, расшифровывает в памяти и
@@ -24,12 +25,61 @@ M1 получает зашифрованный `access_token` в query, расш
 в логах прокси. Cookie/Authorization игнорируются,
 CMS-роли не проверяются; foreign resource ID имеет тот же peer-контракт.
 `equestrian_id` — идентификатор ресурса, не секретный tenant selector.
-Ошибки ввода, маршрутизации и интеграции возвращают локальный `400`, не `401/422/500`.
+Для M1–M6 ошибки ввода, маршрутизации и интеграции возвращают локальный `400`, не `401/422/500`.
 M1 не возвращает `204` (этот статус относится к DELETE соседнего yandex-service).
 
 Это явные dev service-to-service исключения, **не публичный production API**.
 Production выпуск блокируется до подтверждения внешней сетевой защиты
 чувствительных peers. Данный change не доказывает production isolation.
+
+## История задач Метрики
+
+`GET /api/metrica/tasks` — чувствительное внутреннее чтение, **не Public Read**
+для сайтов. Заголовок `X-Equestrian-Id` обязателен: missing/invalid UUID даёт
+`401` **до** разбора query и открытия read session. Это non-secret identity hint,
+не аутентификация. Cookie/Bearer игнорируются и не заменяют selector; CMS-роли
+проверяет gateway `/api/seo/metrica/tasks`, а не этот peer.
+
+Query: только `limit` (default 20, 1..100) и `offset` (default 0, ≥0).
+Принимаются десятичные целые, не дроби, exponent notation, bool или пробелы;
+некорректный query при валидном selector даёт `400` до storage, не `422`.
+Ошибки storage/сериализации возвращают безопасный generic `400`, без SQL,
+токенов, payload ошибок и checkpoints. Никаких автоматических peer-вызовов,
+NATS-команд, write/commit/locks в новом use case нет.
+
+Ответ содержит только `items` и `total`:
+
+```json
+{"items":[{"id":"merge:00000000-0000-0000-0000-000000000001","type":"merge","status":"running","is_active":true,"created_at":"2026-10-20T00:00:00Z"}],"total":1}
+```
+
+Поля item обязательны: строковый `id`, `type=parsing|merge|delete`,
+`status=queued|running|succeeded|failed|cancelled`, boolean `is_active`,
+RFC3339 `created_at` с часовым поясом. `is_active=true` только для queued/running.
+Технические подзадачи, counter/account ID и приватные поля не выдаются.
+`failed_blocked` показан как failed и **не** означает снятия maintenance barrier.
+
+Это **история задач конюшни, включая предыдущие привязки**, без фильтра текущего
+счётчика и без требования действующей привязки. Intent и run представлены одной
+логической строкой `parsing:<job_id>`; legacy run с NULL job_id —
+`parsing-run:<run_id>`, maintenance — `merge:<operation_id>` / `delete:<operation_id>`.
+Серверный порядок общий: `is_active DESC, created_at DESC, id DESC` до пагинации.
+`total` — число логических строк до пагинации в том же снимке; пустая история —
+`{"items":[],"total":0}`, offset за концом — пустые items с реальным total.
+Между отдельными GET состояние может измениться; snapshot на всю UI-сессию
+не обещается. Не дошедшая команда не восстанавливается: 202 запуска не означает
+появления строки или завершения обработки; перечитывание — явным GET.
+
+Request-local DI: `create_metrica_task_list_service(session)` →
+`MetricaTaskListService` → `MetricaTaskListRepositoryProtocol`; новая session
+создаётся только после selector/query validation и закрывается без commit.
+Production DTO: `core.schemas.api.metrica_tasks.MetricaTaskListOutDto`,
+сериализация `model_dump_json()` / `model_dump(mode="json")`.
+Offline API tests используют production route/DTO/use case с fake repository,
+**не доказывают real PostgreSQL acceptance**. PG-01..04 требуют отдельного
+изолированного test target/permit и запуска разрешённым infra runner.
+Production release остаётся блокирован до подтверждения внешней недоступности
+peer **и БД**; Compose network сама по себе не доказывает изоляцию.
 
 ## NATS JetStream
 

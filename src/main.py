@@ -9,7 +9,8 @@ from nats.js.errors import BadRequestError
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from api import page_stats_router, yandex_metrica, yandex_metrica_router
+from api import metrica_tasks_router, page_stats_router, yandex_metrica, yandex_metrica_router
+from api.metrica_tasks import InvalidMetricaTaskSelector
 from api.search_query_stats import router as search_query_stats_router
 from clients.nats.client import NatsJetstreamClient
 from clients.nats.consumers.parse_run import ParseRunConsumer
@@ -135,6 +136,7 @@ router = APIRouter(prefix="/api")
 router.include_router(yandex_metrica_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(page_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
 router.include_router(search_query_stats_router, prefix="/metrica", tags=["Yandex Metrica"])
+router.include_router(metrica_tasks_router, prefix="/metrica", tags=["Yandex Metrica"])
 app.include_router(router)
 
 
@@ -182,3 +184,8 @@ async def unexpected_error_handler(_: Request, exc: Exception) -> JSONResponse:
     # No raw exception, request URL, body, or chained traceback in application logs.
     logger.error("Request failed: unexpected")
     return JSONResponse(status_code=400, content={"detail": "Ошибка обработки запроса"})
+
+
+@app.exception_handler(InvalidMetricaTaskSelector)
+async def metrica_task_selector_error_handler(_: Request, exc: InvalidMetricaTaskSelector) -> JSONResponse:
+    return JSONResponse(status_code=401, content={"detail": "Некорректный selector конюшни"})

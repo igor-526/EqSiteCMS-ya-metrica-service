@@ -12,6 +12,8 @@ from containers.clients import ClientsContainer
 from containers.repositories import RepositoriesContainer
 from containers.services import ServicesContainer
 from containers.settings import SettingsContainer
+from core.services.metrica_task_list_service import MetricaTaskListService
+from repositories.metrica_task_list_repository import MetricaTaskListRepository
 from settings import NatsSettings
 from utils.database import worker_session
 from workers.app_factory import create_celery_app
@@ -47,6 +49,11 @@ def create_page_stats_services(session: AsyncSession) -> ServicesContainer:
     """Request-local read graph; unrelated clients and workers stay lazy."""
     repositories = RepositoriesContainer(session=providers.Object(session))
     return ServicesContainer(repositories_container=repositories)
+
+
+def create_metrica_task_list_service(session: AsyncSession) -> MetricaTaskListService:
+    """Request-local read graph; no global provider overrides or write hooks."""
+    return MetricaTaskListService(repository=MetricaTaskListRepository(session))
 
 
 def create_search_query_stats_services(session: AsyncSession) -> ServicesContainer:

@@ -1,0 +1,30 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migration-{{ .Release.Revision }}
+  labels:
+    components: {{ .Values.componentsLabel }}
+    app.kubernetes.io/component: migration
+  annotations:
+    helm.sh/hook: pre-upgrade,pre-install
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-migration
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecertName }}
+      containers:
+        - name: migration
+          image: "{{ .Values.image }}:{{ .Values.imageTag }}"
+          imagePullPolicy: IfNotPresent
+          command: {{ toJson .Values.migration.command }}
+          workingDir: {{ .Values.migration.workingDir }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secretName }}

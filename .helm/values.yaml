@@ -1,0 +1,44 @@
+# Deployment settings
+name: eqcms-ya-metrica-service
+componentsLabel: ya-metrica-service
+replicaCount: 1
+namespace: cms
+
+# App settings
+secretName: eqsitecms-ya-metrica-service-secret
+containerPort: 8000
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+metrics:
+  enabled: true
+  metricsPort: 9000
+  interval: 30s
+
+# Image settings
+image: ghcr.io/igor-526/eqsitecms-ya-metrica-service
+imagePullSecertName: ghcr-secret
+imageTag: latest
+
+migration:
+  command: ["uv", "run", "alembic", "-c", "alembic.ini", "upgrade", "head"]
+  workingDir: /app/src
+
+workers:
+  - name: celery-worker
+    command: ["uv", "run", "--no-sync", "celery", "-A", "workers.celery_app", "worker", "-Q", "ya_metrica", "-l", "info", "--concurrency", "1", "--hostname", "ya_metrica@%h"]
+    replicas: 1
+  - name: celery-beat
+    command: ["uv", "run", "--no-sync", "celery", "-A", "workers.celery_app", "beat", "-l", "info", "--schedule", "/app/celerybeat-schedule"]
+    replicas: 1
+  - name: cleanup-worker
+    command: ["uv", "run", "--no-sync", "celery", "-A", "workers.celery_app", "worker", "-Q", "ya_metrica_cleanup", "-l", "info", "--concurrency", "1", "--hostname", "ya-metrica-cleanup-worker@%h"]
+    replicas: 1
+  - name: merge-worker
+    command: ["uv", "run", "--no-sync", "celery", "-A", "workers.celery_app", "worker", "-Q", "ya_metrica_merge", "-l", "info", "--concurrency", "1", "--hostname", "ya-metrica-merge-worker@%h"]
+    replicas: 1

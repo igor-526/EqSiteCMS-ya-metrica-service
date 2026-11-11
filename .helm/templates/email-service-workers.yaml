@@ -1,0 +1,33 @@
+{{- range .Values.workers }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $.Release.Name }}-{{ .name }}
+  labels:
+    components: {{ $.Values.componentsLabel }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: {{ $.Release.Name }}-{{ .name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $.Release.Name }}-{{ .name }}
+    spec:
+      imagePullSecrets:
+        - name: {{ $.Values.imagePullSecertName }}
+      containers:
+        - name: {{ .name }}
+          image: "{{ $.Values.image }}:{{ $.Values.imageTag }}"
+          imagePullPolicy: IfNotPresent
+          command: {{ toJson .command }}
+          workingDir: /app/src
+          envFrom:
+            - secretRef:
+                name: {{ $.Values.secretName }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+{{- end }}
